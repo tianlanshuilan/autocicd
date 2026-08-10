@@ -1,0 +1,135 @@
+name: Build Cross-Platform
+
+on:
+  push:
+    tags:
+      - 'v*'  # 推送版本标签时触发
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: auto-cicd-linux
+            asset_name: auto-cicd-linux-x64
+          - os: macos-latest
+            artifact_name: auto-cicd-macos
+            asset_name: auto-cicd-macos-x64
+          - os: windows-latest
+            artifact_name: auto-cicd-windows.exe
+            asset_name: auto-cicd-windows-x64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build with PyInstaller (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: |
+          pyinstaller auto-cicd.spec --clean --noconfirm
+          chmod +x dist/auto-cicd
+
+      - name: Build with PyInstaller (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          pyinstaller auto-cicd.spec --clean --noconfirm
+
+      - name: Verify build output (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: |
+          ls -la dist/
+          file dist/auto-cicd
+
+      - name: Verify build output (Windows)
+        if: matrix.os == 'windows-latest'
+        run: |
+          dir dist\
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            dist/auto-cicd
+            dist/auto-cicd.exe
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          # Linux
+          if [ -f artifacts/auto-cicd-linux-x64/auto-cicd ]; then
+            chmod +x artifacts/auto-cicd-linux-x64/auto-cicd
+            cp artifacts/auto-cicd-linux-x64/auto-cicd release/auto-cicd-linux-x64
+          fi
+          # macOS
+          if [ -f artifacts/auto-cicd-macos-x64/auto-cicd ]; then
+            chmod +x artifacts/auto-cicd-macos-x64/auto-cicd
+            cp artifacts/auto-cicd-macos-x64/auto-cicd release/auto-cicd-macos-x64
+          fi
+          # Windows
+          if [ -f artifacts/auto-cicd-windows-x64.exe/auto-cicd.exe ]; then
+            cp artifacts/auto-cicd-windows-x64.exe/auto-cicd.exe release/auto-cicd-windows-x64.exe
+          fi
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/auto-cicd-linux-x64
+            release/auto-cicd-macos-x64
+            release/auto-cicd-windows-x64.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

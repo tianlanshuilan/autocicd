@@ -1,0 +1,212 @@
+name: Build Desktop App
+
+on:
+  push:
+    tags:
+      - 'v*'  # 推送版本标签时触发
+    paths:
+      - 'desktop/**'
+      - 'frontend/**'
+      - 'backend/**'
+      - 'auto-cicd-desktop.spec'
+  workflow_dispatch:  # 手动触发
+
+jobs:
+  build-macos:
+    name: Build macOS
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywebview
+          cd frontend && npm ci && npm run build
+
+      - name: Build desktop app
+        run: |
+          pyinstaller auto-cicd-desktop.spec --clean --noconfirm
+
+      - name: Create DMG
+        run: |
+          chmod +x desktop/installer/macos/build-dmg.sh
+          ./desktop/installer/macos/build-dmg.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoCICD-macOS
+          path: |
+            dist/AutoCICD.app
+            dist/AutoCICD-Installer.dmg
+          retention-days: 30
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywebview
+          cd frontend && npm ci && npm run build
+
+      - name: Build desktop app
+        run: |
+          pyinstaller auto-cicd-desktop.spec --clean --noconfirm
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoCICD-Windows
+          path: dist/AutoCICD.exe
+          retention-days: 30
+
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pywebview
+          cd frontend && npm ci && npm run build
+
+      - name: Install Linux GUI dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.0-0 libgtk-3-0
+
+      - name: Build desktop app
+        run: |
+          pyinstaller auto-cicd-desktop.spec --clean --noconfirm
+          chmod +x dist/AutoCICD
+
+      - name: Create Linux packages
+        run: |
+          chmod +x desktop/installer/linux/build-package.sh
+          ./desktop/installer/linux/build-package.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AutoCICD-Linux
+          path: |
+            dist/AutoCICD
+            dist/*.deb
+            dist/*.AppImage
+          retention-days: 30
+          if-no-files-found: ignore
+
+  release:
+    name: Create Release
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          
+          # macOS
+          if [ -f artifacts/AutoCICD-macOS/AutoCICD-Installer.dmg ]; then
+            cp artifacts/AutoCICD-macOS/AutoCICD-Installer.dmg release/AutoCICD-macOS.dmg
+          fi
+          
+          # Windows
+          if [ -f artifacts/AutoCICD-Windows/AutoCICD.exe ]; then
+            cp artifacts/AutoCICD-Windows/AutoCICD.exe release/AutoCICD-Windows.exe
+          fi
+          
+          # Linux
+          if [ -f artifacts/AutoCICD-Linux/AutoCICD ]; then
+            chmod +x artifacts/AutoCICD-Linux/AutoCICD
+            cp artifacts/AutoCICD-Linux/AutoCICD release/AutoCICD-Linux
+          fi
+          for deb in artifacts/AutoCICD-Linux/*.deb; do
+            [ -f "$deb" ] && cp "$deb" release/
+          done
+          
+          ls -la release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/AutoCICD-macOS.dmg
+            release/AutoCICD-Windows.exe
+            release/AutoCICD-Linux
+            release/*.deb
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## CI/CD 流水线自动搭建平台
+            
+            ### 下载说明
+            
+            | 平台 | 文件 | 说明 |
+            |------|------|------|
+            | **macOS** | `AutoCICD-macOS.dmg` | 双击挂载，拖入 Applications |
+            | **Windows** | `AutoCICD-Windows.exe` | 双击运行 |
+            | **Linux** | `AutoCICD-Linux` | 直接运行 |
+            | **Linux (Debian/Ubuntu)** | `autocicd_*.deb` | `sudo dpkg -i` 安装 |
+            
+            ### 系统要求
+            - macOS 10.15+
+            - Windows 10+
+            - Linux (GTK 3, WebKit2GTK)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

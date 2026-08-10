@@ -1,0 +1,39 @@
+# CI/CD 流水线自动搭建平台 - Git 忽略配置
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+
+# Node.js
+frontend/node_modules/
+frontend/dist/
+
+# 输出目录
+output/
+
+# 离线安装包（大文件，不纳入版本控制）
+# 运行 ./download-bundled-tools.sh 下载
+bundled-tools/jenkins/*.war
+bundled-tools/runner/*/gitlab-runner
+bundled-tools/jdk/*/*.tar.gz
+bundled-tools/docker/*/*.tgz
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 打包产物
+*.spec.bak
