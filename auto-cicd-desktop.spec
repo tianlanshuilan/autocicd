@@ -92,11 +92,9 @@ a = Analysis(
         'websockets',
         # HTTP 客户端
         'httpx',
-        'requests',
         'aiohttp',
         # SSH
         'paramiko',
-        'ssh2',
         # pywebview
         'webview',
         # 生成器模块
