@@ -5,7 +5,12 @@ PyInstaller 配置文件 - CI/CD 流水线自动搭建平台
 """
 import os
 import sys
+import io
 from PyInstaller.utils.hooks import copy_metadata
+
+# Windows cp1252 encoding fix
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 block_cipher = None
 
