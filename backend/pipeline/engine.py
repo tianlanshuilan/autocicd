@@ -15,14 +15,12 @@ from .credential import CredentialStore
 # 步骤定义
 STEPS = [
     {"id": "git_clone", "name": "克隆代码仓库", "order": 1},
-    {"id": "generate_config", "name": "生成配置文件", "order": 2},
-    {"id": "git_push", "name": "推送配置到仓库", "order": 3},
-    {"id": "branch_select", "name": "选择集成分支", "order": 4},
+    {"id": "branch_select", "name": "选择集成分支", "order": 2},
+    {"id": "generate_config", "name": "生成配置文件", "order": 3},
+    {"id": "git_push", "name": "推送配置到仓库", "order": 4},
     {"id": "ssh_connect", "name": "连接目标服务器", "order": 5},
-    {"id": "setup_env", "name": "初始化服务器环境", "order": 6},
-    {"id": "deploy", "name": "部署并启动服务", "order": 7},
-    {"id": "approval", "name": "审批确认", "order": 8},
-    {"id": "merge", "name": "合并到主分支", "order": 9},
+    {"id": "install_tool", "name": "安装 CI/CD 工具", "order": 6},
+    {"id": "configure_pipeline", "name": "配置流水线", "order": 7},
 ]
 
 
@@ -125,20 +123,20 @@ class PipelineEngine:
             if result["status"] == "failed":
                 return self._build_result(results, False)
 
-            # Step 2: 生成配置文件
+            # Step 2: 分支选择（在生成配置前，确保多分支选择生效）
+            result = await self._step_branch_select()
+            results.append(result)
+            if result["status"] == "failed":
+                return self._build_result(results, False)
+
+            # Step 3: 生成配置文件
             result = await self._step_generate_config()
             results.append(result)
             if result["status"] == "failed":
                 return self._build_result(results, False)
 
-            # Step 3: Git Push
+            # Step 4: Git Push
             result = await self._step_git_push()
-            results.append(result)
-            if result["status"] == "failed":
-                return self._build_result(results, False)
-
-            # Step 4: 分支选择
-            result = await self._step_branch_select()
             results.append(result)
             if result["status"] == "failed":
                 return self._build_result(results, False)
@@ -274,13 +272,17 @@ class PipelineEngine:
                 setattr(cfg, 'serverUser', server_config.get('username', 'root'))
                 setattr(cfg, 'deployPath', server_config.get('deployPath', '/opt/apps'))
                 setattr(cfg, 'backupBeforeDeploy', server_config.get('backupBeforeDeploy', True))
-                # 堡垒机配置（用于生成的 Pipeline 穿透访问）
-                setattr(cfg, 'bastionHost', server_config.get('bastionHost', ''))
-                setattr(cfg, 'bastionPort', server_config.get('bastionPort', 22))
-                setattr(cfg, 'bastionUser', server_config.get('bastionUser', ''))
-                setattr(cfg, 'bastionAuthType', server_config.get('bastionAuthType', 'password'))
-                setattr(cfg, 'bastionPassword', server_config.get('bastionPassword', ''))
-                setattr(cfg, 'bastionSshKey', server_config.get('bastionSshKey', ''))
+                # 堡垒机配置（用于生成的 Pipeline 穿透访问，仅在启用开关时生效）
+                if server_config.get('useBastion', False):
+                    setattr(cfg, 'bastionHost', server_config.get('bastionHost', ''))
+                    setattr(cfg, 'bastionPort', server_config.get('bastionPort', 22))
+                    setattr(cfg, 'bastionUser', server_config.get('bastionUser', ''))
+                    setattr(cfg, 'bastionAuthType', server_config.get('bastionAuthType', 'password'))
+                    setattr(cfg, 'bastionPassword', server_config.get('bastionPassword', ''))
+                    setattr(cfg, 'bastionSshKey', server_config.get('bastionSshKey', ''))
+                else:
+                    setattr(cfg, 'bastionHost', '')
+                    setattr(cfg, 'bastionUser', '')
 
             loop = asyncio.get_event_loop()
             self.generated_files = await loop.run_in_executor(

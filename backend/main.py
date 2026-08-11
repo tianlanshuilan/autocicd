@@ -85,6 +85,7 @@ class ServerConfig(BaseModel):
     deployPath: str = "/opt/apps"
     backupBeforeDeploy: bool = True  # 部署前备份旧版本
     # 堡垒机/跳板机配置（用于生成的 Pipeline 穿透访问）
+    useBastion: bool = False        # 是否启用堡垒机跳转
     bastionHost: str = ""           # 堡垒机地址
     bastionPort: int = 22           # 堡垒机端口
     bastionUser: str = ""           # 堡垒机用户名
@@ -163,6 +164,7 @@ class AutoDeployConfig(BaseModel):
     networkAccess: Optional[NetworkAccessConfig] = None
     appServer: Optional[AppServerConfig] = None
     releaseStrategy: Optional[dict] = None  # 发布策略
+    useChinaMirror: bool = False  # 是否使用国内镜像（用于国产 OS 或国内网络环境）
 
 
 @app.get("/api/tools")

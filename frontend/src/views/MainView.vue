@@ -852,9 +852,9 @@ const projectTypes = [
 
 const pipelineSteps = [
   { id: 'git_clone', name: '克隆代码仓库', order: 1 },
-  { id: 'generate_config', name: '生成流水线配置', order: 2 },
-  { id: 'git_push', name: '推送配置到仓库', order: 3 },
-  { id: 'branch_select', name: '选择集成分支', order: 4 },
+  { id: 'branch_select', name: '选择集成分支', order: 2 },
+  { id: 'generate_config', name: '生成流水线配置', order: 3 },
+  { id: 'git_push', name: '推送配置到仓库', order: 4 },
   { id: 'ssh_connect', name: '连接目标服务器', order: 5 },
   { id: 'install_tool', name: '安装 CI/CD 工具', order: 6 },
   { id: 'configure_pipeline', name: '配置流水线', order: 7 },
