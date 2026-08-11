@@ -97,6 +97,19 @@ def _build_pipeline(c):
     artifacts_path = _get_artifacts_path(c)
     deploy_cmd = _get_deploy_cmd(c)
     branches = _get_branches(c)
+    
+    # 服务器和堡垒机配置
+    server_host = getattr(c, 'serverHost', '')
+    server_user = getattr(c, 'serverUser', 'root')
+    deploy_path = getattr(c, 'deployPath', '/opt/apps')
+    bastion_host = getattr(c, 'bastionHost', '')
+    bastion_port = getattr(c, 'bastionPort', 22)
+    bastion_user = getattr(c, 'bastionUser', '')
+    
+    # 生成 SSH 选项
+    ssh_options = "-o StrictHostKeyChecking=no"
+    if bastion_host and bastion_user:
+        ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
 
     # Auto-determine build steps based on project type
     if c.projectType.startswith("java"):
@@ -170,6 +183,10 @@ stages:
 variables:
   REPO_URL: "{c.repoUrl}"
   PORT: "{c.port}"
+  SERVER_HOST: "{server_host}"
+  SERVER_USER: "{server_user}"
+  DEPLOY_PATH: "{deploy_path}"
+  SSH_OPTIONS: "{ssh_options}"
 {parallel_jobs}"""
 
     return f"""# GitLab CI Pipeline
@@ -188,6 +205,10 @@ variables:
   REPO_URL: "{c.repoUrl}"
   BRANCH: "{branches[0]}"
   PORT: "{c.port}"
+  SERVER_HOST: "{server_host}"
+  SERVER_USER: "{server_user}"
+  DEPLOY_PATH: "{deploy_path}"
+  SSH_OPTIONS: "{ssh_options}"
 
 build_job:
   stage: build

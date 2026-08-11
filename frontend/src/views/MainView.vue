@@ -338,6 +338,56 @@
                   </span>
                 </label>
               </div>
+              
+              <!-- 堡垒机/跳板机配置 -->
+              <div class="form-group bastion-section">
+                <label class="section-label">
+                  <span>🛡️ 堡垒机/跳板机（可选）</span>
+                  <span class="section-hint">Pipeline 执行时通过堡垒机访问目标服务器</span>
+                </label>
+                <div class="bastion-toggle">
+                  <label class="checkbox-label">
+                    <input type="checkbox" v-model="form.server.useBastion" />
+                    <span class="checkmark"></span>
+                    <span class="check-text">
+                      <span class="check-title">启用堡垒机跳转</span>
+                      <span class="check-desc">目标服务器在堡垒机/零信任网络内，需要通过堡垒机穿透访问</span>
+                    </span>
+                  </label>
+                </div>
+              </div>
+              
+              <template v-if="form.server.useBastion">
+                <div class="form-row">
+                  <div class="form-group">
+                    <label>堡垒机地址</label>
+                    <input v-model="form.server.bastionHost" placeholder="bastion.example.com" />
+                  </div>
+                  <div class="form-group">
+                    <label>堡垒机端口</label>
+                    <input v-model.number="form.server.bastionPort" type="number" placeholder="22" />
+                  </div>
+                </div>
+                <div class="form-group">
+                  <label>堡垒机用户名</label>
+                  <input v-model="form.server.bastionUser" placeholder="root" />
+                </div>
+                <div class="form-group">
+                  <label>堡垒机认证方式</label>
+                  <select v-model="form.server.bastionAuthType">
+                    <option value="password">密码</option>
+                    <option value="ssh_key">SSH 密钥</option>
+                  </select>
+                </div>
+                <div class="form-group" v-if="form.server.bastionAuthType === 'password'">
+                  <label>堡垒机密码</label>
+                  <input v-model="form.server.bastionPassword" type="password" placeholder="可留空，执行时弹窗输入" />
+                </div>
+                <div class="form-group" v-if="form.server.bastionAuthType === 'ssh_key'">
+                  <label>堡垒机 SSH 私钥</label>
+                  <textarea v-model="form.server.bastionSshKey" rows="3" placeholder="粘贴 SSH 私钥内容"></textarea>
+                </div>
+              </template>
             </section>
 
             <!-- 右侧：网络访问链路 -->
@@ -848,6 +898,14 @@ const form = reactive({
     sshKey: '',
     deployPath: '/opt/apps',
     backupBeforeDeploy: true,
+    // 堡垒机配置
+    useBastion: false,
+    bastionHost: '',
+    bastionPort: 22,
+    bastionUser: '',
+    bastionAuthType: 'password',
+    bastionPassword: '',
+    bastionSshKey: '',
   },
   // 网络访问链路
   networkAccess: {

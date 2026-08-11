@@ -74,6 +74,27 @@ def _build_jenkinsfile(c):
     server_host = getattr(c, 'serverHost', '')
     server_user = getattr(c, 'serverUser', 'root')
     deploy_path = getattr(c, 'deployPath', '/opt/apps')
+    
+    # 堡垒机配置
+    bastion_host = getattr(c, 'bastionHost', '')
+    bastion_port = getattr(c, 'bastionPort', 22)
+    bastion_user = getattr(c, 'bastionUser', '')
+    
+    # 生成 SSH 选项（用于穿透堡垒机）
+    ssh_options = "-o StrictHostKeyChecking=no"
+    if bastion_host and bastion_user:
+        ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
+
+    env_block = f"""    environment {{
+        PROJECT_NAME = '{c.projectName}'
+        REPO_URL = '{c.repoUrl}'
+        BRANCH = '{branches[0]}'
+        PORT = '{c.port}'
+        SERVER_HOST = '{server_host}'
+        SERVER_USER = '{server_user}'
+        DEPLOY_PATH = '{deploy_path}'
+        SSH_OPTIONS = '{ssh_options}'
+    }}"""
 
     return f"""// Jenkins Pipeline - {c.projectName}
 // Tool: Jenkins
@@ -82,15 +103,7 @@ def _build_jenkinsfile(c):
 pipeline {{
     agent any
 
-    environment {{
-        PROJECT_NAME = '{c.projectName}'
-        REPO_URL = '{c.repoUrl}'
-        BRANCH = '{branches[0]}'
-        PORT = '{c.port}'
-        SERVER_HOST = '{server_host}'
-        SERVER_USER = '{server_user}'
-        DEPLOY_PATH = '{deploy_path}'
-    }}
+{env_block}
 
     stages {{
 {stage_blocks}
@@ -339,7 +352,7 @@ def _build_deploy_stage(c):
         backup_step = f"""
                 // 备份旧版本
                 echo '备份旧版本...'
-                ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                     DEPLOY_DIR={deploy_path}/${{PROJECT_NAME}}
                     BACKUP_DIR={deploy_path}/backup
                     if [ -d \"$DEPLOY_DIR\" ]; then
@@ -361,14 +374,14 @@ def _build_deploy_stage(c):
                     echo '部署到目标服务器...'
 {backup_step}
                     // 停止旧服务
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "{c.projectName}.jar" 2>/dev/null || true
                         sleep 2
                     '''
                     // 传输新包
-                    scp target/{c.projectName}.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    scp ${{SSH_OPTIONS}} target/{c.projectName}.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
                     // 启动新服务
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         nohup java -jar {c.projectName}.jar --server.port={c.port} > app.log 2>&1 &
                         echo "应用已启动，端口: {c.port}"
@@ -382,12 +395,12 @@ def _build_deploy_stage(c):
                 script {{
                     echo '部署到目标服务器...'
 {backup_step}
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "{c.projectName}" 2>/dev/null || true
                         sleep 2
                     '''
-                    scp build/libs/{c.projectName}-*.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    scp ${{SSH_OPTIONS}} build/libs/{c.projectName}-*.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         nohup java -jar {c.projectName}-*.jar --server.port={c.port} > app.log 2>&1 &
                         echo "应用已启动，端口: {c.port}"
@@ -402,12 +415,12 @@ def _build_deploy_stage(c):
                     echo '部署到目标服务器...'
 {backup_step}
                     // 清理旧文件并传输新文件
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         rm -rf {deploy_path}/${{PROJECT_NAME}}/dist/*
                     '''
-                    scp -r dist/* ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/dist/
+                    scp ${{SSH_OPTIONS}} -r dist/* ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/dist/
                     // 重启 Nginx
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         sudo nginx -s reload 2>/dev/null || sudo systemctl reload nginx
                         echo "Nginx 已重新加载"
                     '''
@@ -420,12 +433,12 @@ def _build_deploy_stage(c):
                 script {{
                     echo '部署到目标服务器...'
 {backup_step}
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "python.*{c.projectName}" 2>/dev/null || true
                         sleep 2
                     '''
-                    scp -r . ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    scp ${{SSH_OPTIONS}} -r . ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         pip install -r requirements.txt -q
                         nohup python app.py > app.log 2>&1 &
@@ -440,12 +453,12 @@ def _build_deploy_stage(c):
                 script {{
                     echo '部署到目标服务器...'
 {backup_step}
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "./app" 2>/dev/null || true
                         sleep 2
                     '''
-                    scp ./app ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
-                    ssh -o StrictHostKeyChecking=no ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    scp ${{SSH_OPTIONS}} ./app ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         chmod +x app
                         nohup ./app > app.log 2>&1 &

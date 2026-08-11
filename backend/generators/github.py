@@ -174,6 +174,20 @@ def _build_deploy_workflow(c):
     deploy_cmd = _get_deploy_cmd(c)
     branches = _get_branches(c)
     branch_list = ", ".join(branches)
+    
+    # 服务器和堡垒机配置
+    server_host = getattr(c, 'serverHost', '')
+    server_user = getattr(c, 'serverUser', 'root')
+    deploy_path = getattr(c, 'deployPath', '/opt/apps')
+    bastion_host = getattr(c, 'bastionHost', '')
+    bastion_port = getattr(c, 'bastionPort', 22)
+    bastion_user = getattr(c, 'bastionUser', '')
+    
+    # 生成 SSH 选项
+    ssh_options = "-o StrictHostKeyChecking=no"
+    if bastion_host and bastion_user:
+        ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
+    
     return f"""# GitHub Actions Deploy
 # 项目: {c.projectName}
 # 工具: GitHub Actions
@@ -186,6 +200,12 @@ on:
     workflows: ["CI Pipeline"]
     types: [completed]
     branches: [{branch_list}]
+
+env:
+  SERVER_HOST: "{server_host}"
+  SERVER_USER: "{server_user}"
+  DEPLOY_PATH: "{deploy_path}"
+  SSH_OPTIONS: "{ssh_options}"
 
 jobs:
   deploy:

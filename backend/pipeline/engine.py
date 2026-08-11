@@ -274,6 +274,13 @@ class PipelineEngine:
                 setattr(cfg, 'serverUser', server_config.get('username', 'root'))
                 setattr(cfg, 'deployPath', server_config.get('deployPath', '/opt/apps'))
                 setattr(cfg, 'backupBeforeDeploy', server_config.get('backupBeforeDeploy', True))
+                # 堡垒机配置（用于生成的 Pipeline 穿透访问）
+                setattr(cfg, 'bastionHost', server_config.get('bastionHost', ''))
+                setattr(cfg, 'bastionPort', server_config.get('bastionPort', 22))
+                setattr(cfg, 'bastionUser', server_config.get('bastionUser', ''))
+                setattr(cfg, 'bastionAuthType', server_config.get('bastionAuthType', 'password'))
+                setattr(cfg, 'bastionPassword', server_config.get('bastionPassword', ''))
+                setattr(cfg, 'bastionSshKey', server_config.get('bastionSshKey', ''))
 
             loop = asyncio.get_event_loop()
             self.generated_files = await loop.run_in_executor(

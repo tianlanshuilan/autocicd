@@ -84,6 +84,13 @@ class ServerConfig(BaseModel):
     sshKey: str = ""
     deployPath: str = "/opt/apps"
     backupBeforeDeploy: bool = True  # 部署前备份旧版本
+    # 堡垒机/跳板机配置（用于生成的 Pipeline 穿透访问）
+    bastionHost: str = ""           # 堡垒机地址
+    bastionPort: int = 22           # 堡垒机端口
+    bastionUser: str = ""           # 堡垒机用户名
+    bastionAuthType: str = "password"  # password | sshKey
+    bastionPassword: str = ""       # 堡垒机密码
+    bastionSshKey: str = ""         # 堡垒机 SSH 密钥
 
 
 class RelayServerConfig(BaseModel):
