@@ -103,6 +103,10 @@ def _build_jenkinsfile(c):
 pipeline {{
     agent any
 
+    triggers {{
+        pollSCM('H/2 * * * *')  // 每 2 分钟轮询，有新提交自动触发
+    }}
+
 {env_block}
 
     stages {{
@@ -175,6 +179,10 @@ def _build_multibranch_jenkinsfile(c, branches):
 
 pipeline {{
     agent none
+
+    triggers {{
+        pollSCM('H/2 * * * *')  // 每 2 分钟轮询，有新提交自动触发
+    }}
 
     environment {{
         PROJECT_NAME = '{c.projectName}'

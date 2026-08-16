@@ -151,6 +151,7 @@ on:
     branches: [{branch_list}]
   pull_request:
     branches: [{branch_list}]
+  workflow_dispatch:  # 支持手动触发流水线
 
 jobs:
   build:
@@ -200,6 +201,7 @@ on:
     workflows: ["CI Pipeline"]
     types: [completed]
     branches: [{branch_list}]
+  workflow_dispatch:  # 支持手动触发部署
 
 env:
   SERVER_HOST: "{server_host}"
@@ -243,6 +245,7 @@ on:
     workflows: ["CI Pipeline"]
     types: [completed]
     branches: [{branch_list}]
+  workflow_dispatch:  # 支持手动触发部署
 
 jobs:
   approve-merge:

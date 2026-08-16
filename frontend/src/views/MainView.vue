@@ -1057,6 +1057,10 @@ const canExecute = computed(() => {
     // 自动搭建模式需要更多条件
     if (!form.server.host) return false
     if (!form.branch || form.branch.trim() === '') return false
+    // 专用服务器模式：工具服务器地址必填
+    if (form.toolDeploy === 'dedicated' && !form.toolServer.host) return false
+    // 启用堡垒机：堡垒机地址和用户名必填
+    if (form.server.useBastion && (!form.server.bastionHost || !form.server.bastionUser)) return false
   }
   
   return true
@@ -1193,6 +1197,16 @@ async function onAutoDeploy() {
   }
   if (!form.server.host) {
     error.value = '请填写目标服务器地址'
+    return
+  }
+  // 专用服务器模式：必须填写工具服务器地址
+  if (form.toolDeploy === 'dedicated' && !form.toolServer.host) {
+    error.value = '已选择专用服务器部署，请填写 CI/CD 工具服务器地址'
+    return
+  }
+  // 启用堡垒机：必须填写堡垒机地址和用户
+  if (form.server.useBastion && (!form.server.bastionHost || !form.server.bastionUser)) {
+    error.value = '已启用堡垒机跳转，请填写堡垒机地址和用户名'
     return
   }
 

@@ -401,7 +401,7 @@ class PipelineEngine:
         return {"step": step, "status": "success", "message": "使用默认分支"}
 
     async def _step_ssh_connect(self) -> dict:
-        """Step 4: SSH 连接目标服务器（支持多跳链路）"""
+        """Step 4: SSH 连接工具安装目标服务器（支持多跳链路）"""
         step = "ssh_connect"
 
         server = self.config.get("server", {})
@@ -413,15 +413,36 @@ class PipelineEngine:
             await self.send_message(step, "failed", "未配置服务器地址")
             return {"step": step, "status": "failed", "message": "服务器地址为空"}
 
-        server_cred = {
-            "authType": server.get("authType", "password"),
-            "password": server.get("password", ""),
-            "sshKey": server.get("sshKey", ""),
-        }
+        # 确定实际安装目标：专用服务器模式下工具装到 toolServer，否则装到目标服务器
+        tool_deploy = self.config.get("toolDeploy", "target")
+        tool_server = self.config.get("toolServer", {}) or {}
+        use_dedicated = (tool_deploy == "dedicated" and tool_server.get("host"))
 
-        # 检查目标服务器凭据
+        if use_dedicated:
+            install_host = tool_server["host"]
+            install_port = tool_server.get("port", 22)
+            install_username = tool_server.get("username", "root")
+            target_label = f"专用工具服务器 {install_host}"
+        else:
+            install_host = server["host"]
+            install_port = server.get("port", 22)
+            install_username = server.get("username", "root")
+            target_label = f"目标服务器 {install_host}"
+
+        server_cred = {
+            "authType": (tool_server.get("authType", "password") if use_dedicated else server.get("authType", "password")),
+            "password": (tool_server.get("password", "") if use_dedicated else server.get("password", "")),
+            "sshKey": (tool_server.get("sshKey", "") if use_dedicated else server.get("sshKey", "")),
+        }
+        # 兼容旧字段名
+        server_cred["authType"] = server_cred.get("authType") or server_cred.get("auth_type", "password")
+        server_cred["password"] = server_cred.get("password") or server_cred.get("passwd", "")
+        server_cred["sshKey"] = server_cred.get("sshKey") or server_cred.get("ssh_key", "")
+
+        # 检查安装目标服务器凭据
+        cred_type = "tool_server" if use_dedicated else "server"
         if server_cred["authType"] == "password" and not server_cred["password"]:
-            cred = await self.request_credential("server", "需要服务器密码才能连接")
+            cred = await self.request_credential(cred_type, f"需要{target_label}密码才能连接")
             if cred:
                 server_cred.update(cred)
             else:
@@ -429,7 +450,7 @@ class PipelineEngine:
                 return {"step": step, "status": "failed", "message": "凭据缺失"}
 
         if server_cred["authType"] == "ssh_key" and not server_cred["sshKey"]:
-            cred = await self.request_credential("server", "需要 SSH 密钥才能连接服务器")
+            cred = await self.request_credential(cred_type, f"需要{target_label} SSH 密钥才能连接")
             if cred:
                 server_cred.update(cred)
             else:
@@ -486,30 +507,32 @@ class PipelineEngine:
         # 生成连接日志
         if jump_chain:
             hop_labels = [f"{h['type']}({h['host']})" for h in jump_chain]
-            chain_desc = " → ".join(hop_labels) + f" → 目标({server['host']})"
+            chain_desc = " → ".join(hop_labels) + f" → 目标({install_host})"
             await self.send_message(step, "running", f"正在通过链路连接: {chain_desc}")
+        elif use_dedicated:
+            await self.send_message(step, "running", f"正在连接专用工具服务器 {install_host}:{install_port}...")
         else:
             await self.send_message(step, "running", "正在连接目标服务器...")
 
         # 确定最终目标地址（可能被零信任跳覆盖）
-        target_host = server["host"]
+        target_host = install_host
         if jump_chain and jump_chain[-1].get("targetHost"):
             target_host = jump_chain[-1]["targetHost"]
 
-        # 创建 SSHOps（支持多跳链路）
-        if jump_chain:
+        # 创建 SSHOps（支持多跳链路；专用服务器模式直连）
+        if jump_chain and not use_dedicated:
             self.ssh_ops = SSHOps(
                 host=target_host,
-                port=server.get("port", 22),
-                username=server.get("username", "root"),
+                port=install_port,
+                username=install_username,
                 credential=server_cred,
                 jump_chain=jump_chain,
             )
         else:
             self.ssh_ops = SSHOps(
-                host=server["host"],
-                port=server.get("port", 22),
-                username=server.get("username", "root"),
+                host=install_host,
+                port=install_port,
+                username=install_username,
                 credential=server_cred,
             )
 
@@ -518,8 +541,10 @@ class PipelineEngine:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: self.ssh_ops.connect(log_cb))
 
-            if jump_chain:
+            if jump_chain and not use_dedicated:
                 await self.send_message(step, "success", f"通过 {len(jump_chain)} 跳链路连接目标服务器成功")
+            elif use_dedicated:
+                await self.send_message(step, "success", f"专用工具服务器 {install_host} 连接成功")
             else:
                 await self.send_message(step, "success", "服务器连接成功")
             return {"step": step, "status": "success", "message": "连接成功"}
