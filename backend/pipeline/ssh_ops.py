@@ -1068,7 +1068,7 @@ systemctl daemon-reload""", log)
         log("📋 注册完成后，推送代码到仓库即可自动触发流水线")
 
     def setup_environment(self, project_type: str, config: dict, log_callback=None):
-        """根据项目类型初始化服务器环境"""
+        """根据项目类型初始化服务器环境（已安装则跳过）"""
         log = log_callback or (lambda msg: None)
 
         log("检测操作系统...")
@@ -1078,80 +1078,192 @@ systemctl daemon-reload""", log)
 
         if project_type == "java-maven":
             jdk = config.get("jdkVersion", "17") or "17"
-            log(f"安装 Java {jdk} 和 Maven...")
-            if is_debian:
-                self.exec_command("apt-get update -qq", log)
-                self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk maven", log)
-            elif is_centos:
-                self.exec_command(f"yum install -y java-{jdk}-openjdk-devel maven", log)
+            # 检查 Java 是否已安装且版本匹配
+            java_ver = self.exec_command("java -version 2>&1 || true", log)
+            if java_ver and (f"version \"{jdk}." in str(java_ver) or f"version \"1.{jdk}." in str(java_ver)):
+                log(f"Java {jdk} 已安装，跳过")
             else:
-                self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk maven 2>/dev/null || yum install -y java-{jdk}-openjdk-devel maven", log)
+                log(f"安装 Java {jdk} 和 Maven...")
+                if is_debian:
+                    self.exec_command("apt-get update -qq", log)
+                    self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk maven", log)
+                elif is_centos:
+                    self.exec_command(f"yum install -y java-{jdk}-openjdk-devel maven", log)
+                else:
+                    self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk maven 2>/dev/null || yum install -y java-{jdk}-openjdk-devel maven", log)
             self.exec_command("java -version", log)
+            # Maven 也检查
+            mvn_ver = self.exec_command("mvn -version 2>&1 || true", log)
+            if mvn_ver and "Apache Maven" in str(mvn_ver):
+                log("Maven 已安装，跳过")
+            else:
+                if is_debian:
+                    self.exec_command("apt-get install -y -qq maven", log)
+                elif is_centos:
+                    self.exec_command("yum install -y maven", log)
+                else:
+                    self.exec_command("apt-get install -y -qq maven 2>/dev/null || yum install -y maven", log)
             self.exec_command("mvn -version", log)
 
         elif project_type == "java-gradle":
             jdk = config.get("jdkVersion", "17") or "17"
-            log(f"安装 Java {jdk} 和 Gradle...")
-            if is_debian:
-                self.exec_command("apt-get update -qq", log)
-                self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk unzip", log)
-            elif is_centos:
-                self.exec_command(f"yum install -y java-{jdk}-openjdk-devel unzip", log)
+            java_ver = self.exec_command("java -version 2>&1 || true", log)
+            if java_ver and (f"version \"{jdk}." in str(java_ver) or f"version \"1.{jdk}." in str(java_ver)):
+                log(f"Java {jdk} 已安装，跳过")
             else:
-                self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk unzip 2>/dev/null || yum install -y java-{jdk}-openjdk-devel unzip", log)
+                log(f"安装 Java {jdk}...")
+                if is_debian:
+                    self.exec_command("apt-get update -qq", log)
+                    self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk unzip", log)
+                elif is_centos:
+                    self.exec_command(f"yum install -y java-{jdk}-openjdk-devel unzip", log)
+                else:
+                    self.exec_command(f"apt-get install -y -qq openjdk-{jdk}-jdk unzip 2>/dev/null || yum install -y java-{jdk}-openjdk-devel unzip", log)
             self.exec_command("java -version", log)
-            log("安装 Gradle...")
-            self.exec_command("curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o /tmp/gradle.zip", log)
-            self.exec_command("unzip -qo /tmp/gradle.zip -d /opt && ln -sf /opt/gradle-8.5/bin/gradle /usr/local/bin/gradle", log)
+            gradle_ver = self.exec_command("gradle --version 2>&1 || true", log)
+            if gradle_ver and "Gradle" in str(gradle_ver):
+                log("Gradle 已安装，跳过")
+            else:
+                log("安装 Gradle...")
+                self.exec_command("curl -sL https://services.gradle.org/distributions/gradle-8.5-bin.zip -o /tmp/gradle.zip", log)
+                self.exec_command("unzip -qo /tmp/gradle.zip -d /opt && ln -sf /opt/gradle-8.5/bin/gradle /usr/local/bin/gradle", log)
             self.exec_command("gradle --version", log)
 
         elif project_type in ("vue", "react"):
             node_ver = config.get("nodeVersion", "20") or "20"
-            log(f"安装 Node.js {node_ver}...")
-            if is_debian:
-                self.exec_command("apt-get update -qq", log)
-                self.exec_command("apt-get install -y -qq curl", log)
-                self.exec_command(f"curl -fsSL https://deb.nodesource.com/setup_{node_ver}.x | bash -", log)
-                self.exec_command("apt-get install -y -qq nodejs", log)
-            elif is_centos:
-                self.exec_command(f"curl -fsSL https://rpm.nodesource.com/setup_{node_ver}.x | bash -", log)
-                self.exec_command("yum install -y nodejs", log)
+            # 检查 Node 是否已安装且版本匹配
+            node_out = self.exec_command("node --version 2>&1 || true", log)
+            if node_out and str(node_out).strip().startswith(f"v{node_ver}."):
+                log(f"Node.js {node_ver} 已安装，跳过")
             else:
-                self.exec_command(f"curl -fsSL https://deb.nodesource.com/setup_{node_ver}.x | bash - 2>/dev/null || curl -fsSL https://rpm.nodesource.com/setup_{node_ver}.x | bash -", log)
-                self.exec_command("apt-get install -y nodejs 2>/dev/null || yum install -y nodejs", log)
+                log(f"安装 Node.js {node_ver}...")
+                if is_debian:
+                    self.exec_command("apt-get update -qq", log)
+                    self.exec_command("apt-get install -y -qq curl", log)
+                    self.exec_command(f"curl -fsSL https://deb.nodesource.com/setup_{node_ver}.x | bash -", log)
+                    self.exec_command("apt-get install -y -qq nodejs", log)
+                elif is_centos:
+                    self.exec_command(f"curl -fsSL https://rpm.nodesource.com/setup_{node_ver}.x | bash -", log)
+                    self.exec_command("yum install -y nodejs", log)
+                else:
+                    self.exec_command(f"curl -fsSL https://deb.nodesource.com/setup_{node_ver}.x | bash - 2>/dev/null || curl -fsSL https://rpm.nodesource.com/setup_{node_ver}.x | bash -", log)
+                    self.exec_command("apt-get install -y nodejs 2>/dev/null || yum install -y nodejs", log)
             self.exec_command("node --version", log)
             self.exec_command("npm --version", log)
 
         elif project_type == "python":
-            log("安装 Python 3 和 pip...")
-            if is_debian:
-                self.exec_command("apt-get update -qq", log)
-                self.exec_command("apt-get install -y -qq python3 python3-pip python3-venv", log)
-            elif is_centos:
-                self.exec_command("yum install -y python3 python3-pip", log)
+            py_ver = self.exec_command("python3 --version 2>&1 || true", log)
+            if py_ver and "Python 3" in str(py_ver):
+                log("Python 3 已安装，跳过")
             else:
-                self.exec_command("apt-get install -y -qq python3 python3-pip 2>/dev/null || yum install -y python3 python3-pip", log)
+                log("安装 Python 3 和 pip...")
+                if is_debian:
+                    self.exec_command("apt-get update -qq", log)
+                    self.exec_command("apt-get install -y -qq python3 python3-pip python3-venv", log)
+                elif is_centos:
+                    self.exec_command("yum install -y python3 python3-pip", log)
+                else:
+                    self.exec_command("apt-get install -y -qq python3 python3-pip 2>/dev/null || yum install -y python3 python3-pip", log)
             self.exec_command("python3 --version", log)
+            pip_ver = self.exec_command("pip3 --version 2>&1 || true", log)
+            if pip_ver and "pip" in str(pip_ver):
+                log("pip 已安装，跳过")
+            else:
+                if is_debian:
+                    self.exec_command("apt-get install -y -qq python3-pip", log)
+                elif is_centos:
+                    self.exec_command("yum install -y python3-pip", log)
+                else:
+                    self.exec_command("apt-get install -y -qq python3-pip 2>/dev/null || yum install -y python3-pip", log)
             self.exec_command("pip3 --version", log)
 
         elif project_type == "go":
-            log("安装 Go 1.21...")
-            self.exec_command("curl -fsSL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -o /tmp/go.tar.gz", log)
-            self.exec_command("rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz", log)
-            self.exec_command("ln -sf /usr/local/go/bin/go /usr/local/bin/go", log)
+            go_ver = self.exec_command("go version 2>&1 || true", log)
+            if go_ver and "go version" in str(go_ver):
+                log("Go 已安装，跳过")
+            else:
+                log("安装 Go 1.21...")
+                self.exec_command("curl -fsSL https://go.dev/dl/go1.21.5.linux-amd64.tar.gz -o /tmp/go.tar.gz", log)
+                self.exec_command("rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tar.gz", log)
+                self.exec_command("ln -sf /usr/local/go/bin/go /usr/local/bin/go", log)
             self.exec_command("go version", log)
 
         # 安装 nginx（前端项目）
         if project_type in ("vue", "react"):
-            log("安装 Nginx...")
-            if is_debian:
-                self.exec_command("apt-get install -y -qq nginx", log)
-            elif is_centos:
-                self.exec_command("yum install -y nginx", log)
+            nginx_ver = self.exec_command("nginx -v 2>&1 || true", log)
+            if nginx_ver and "nginx version" in str(nginx_ver):
+                log("Nginx 已安装，跳过")
             else:
-                self.exec_command("apt-get install -y nginx 2>/dev/null || yum install -y nginx", log)
+                log("安装 Nginx...")
+                if is_debian:
+                    self.exec_command("apt-get install -y -qq nginx", log)
+                elif is_centos:
+                    self.exec_command("yum install -y nginx", log)
+                else:
+                    self.exec_command("apt-get install -y nginx 2>/dev/null || yum install -y nginx", log)
 
         log("环境初始化完成")
+
+    def prepare_deploy_runtime(self, deploy_method: str, project_type: str,
+                               config: dict, use_china_mirror: bool = False,
+                               log_callback=None):
+        """在部署目标服务器上准备项目运行环境
+
+        - deploy_method=docker：确保 Docker + docker-compose 可用
+        - deploy_method=direct/app_server：按项目类型安装语言运行时
+          （Java/Node/Python/Go），已安装则跳过
+
+        Args:
+            deploy_method: 部署方式 docker | direct | app_server
+            project_type: 项目类型（direct 模式下用于选择运行时）
+            config: 完整配置（含 jdkVersion/nodeVersion 等）
+            use_china_mirror: 是否使用国内镜像
+            log_callback: 日志回调
+        """
+        log = log_callback or (lambda msg: None)
+
+        if deploy_method == "docker":
+            sys_info = self.detect_system_info(log)
+
+            # 检查 Docker
+            result = self.exec_command("docker --version 2>/dev/null || true", log)
+            if result and "Docker version" in str(result):
+                log(f"Docker 已安装: {str(result).strip()}")
+            else:
+                log("Docker 未安装，开始安装...")
+                self._install_docker(sys_info, use_china_mirror or sys_info.get('is_china_os', False), log)
+
+            # 检查 docker-compose
+            compose_result = self.exec_command("docker-compose --version 2>/dev/null || docker compose version 2>/dev/null || true", log)
+            if compose_result and ("docker-compose version" in str(compose_result) or "Docker Compose version" in str(compose_result)):
+                log(f"docker-compose 已安装: {str(compose_result).strip()}")
+            else:
+                log("安装 docker-compose...")
+                arch = sys_info.get('arch', 'x86_64')
+                compose_arch = 'x86_64' if arch in ('x86_64', 'amd64') else 'aarch64'
+                try:
+                    self.exec_command(
+                        f"curl -fsSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-{compose_arch} "
+                        f"-o /usr/local/bin/docker-compose && chmod +x /usr/local/bin/docker-compose",
+                        log, timeout=300)
+                except Exception as e:
+                    log(f"docker-compose 下载失败: {e}，尝试 pip 安装...")
+                    self.exec_command("pip3 install docker-compose 2>/dev/null || pip install docker-compose", log)
+                verify = self.exec_command("docker-compose --version 2>/dev/null || true", log)
+                if verify and "version" in str(verify).lower():
+                    log(f"docker-compose 安装完成: {str(verify).strip()}")
+                else:
+                    log("⚠️ docker-compose 安装失败，部署时可能需手动安装")
+
+            # 国内环境配置镜像加速
+            if use_china_mirror or sys_info.get('is_china_os', False):
+                self._configure_docker_mirror(log)
+
+            log("Docker 运行环境准备完成")
+        else:
+            # direct/app_server：安装语言运行时
+            log(f"准备运行环境（{deploy_method} 模式，项目类型: {project_type}）...")
+            self.setup_environment(project_type, config, log)
 
     def backup_deploy(self, deploy_path: str, project_name: str, log_callback=None):
         """备份服务器上的旧版本

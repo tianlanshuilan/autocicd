@@ -8,6 +8,8 @@ def generate_github(config, output_dir):
         files.append({"name": "Dockerfile", "content": dockerfile})
         dockerignore = _build_dockerignore(config)
         files.append({"name": ".dockerignore", "content": dockerignore})
+        from generators.docker import build_docker_compose
+        files.append({"name": "docker-compose.yml", "content": build_docker_compose(config)})
 
     # 多分支发布流程文件
     from generators.workflow import is_multi_branch_workflow, build_rollback_script, build_release_readme
@@ -23,21 +25,23 @@ def generate_github(config, output_dir):
     return files
 
 def _get_build_cmd(c):
+    from generators.offline import maven_build_cmd, npm_build_cmd, pip_install_cmd, go_build_cmd
     if c.projectType == "java-maven":
-        return "mvn clean package -DskipTests"
+        return maven_build_cmd(c)
     elif c.projectType == "java-gradle":
         return "gradle bootJar --no-daemon"
     elif c.projectType in ("vue", "react"):
-        return "npm ci && npm run build"
+        return npm_build_cmd(c)
     elif c.projectType == "python":
-        return "pip install -r requirements.txt"
+        return pip_install_cmd(c)
     elif c.projectType == "go":
-        return "CGO_ENABLED=0 go build -o app ."
+        return go_build_cmd(c, cgo_disabled=True)
     return "echo build"
 
 def _get_test_cmd(c):
+    from generators.offline import maven_test_cmd
     if c.projectType == "java-maven":
-        return "mvn test"
+        return maven_test_cmd(c)
     elif c.projectType == "java-gradle":
         return "gradle test"
     elif c.projectType in ("vue", "react"):
@@ -137,6 +141,19 @@ def _build_workflow(c):
         checkout_ref = f"""        ref: {branches[0]}
 """
 
+    # 依赖仓库检出步骤
+    from generators.offline import has_dep_repo, dep_repo_url, dep_repo_branch
+    checkout_deps_step = ""
+    if has_dep_repo(c):
+        checkout_deps_step = f"""      - name: Checkout Dependencies
+        uses: actions/checkout@v4
+        with:
+          repository: {dep_repo_url(c).split(':')[-1].replace('.git', '')}
+          ref: {dep_repo_branch(c)}
+          path: .dep-repo
+          token: ${{{{ secrets.DEP_REPO_TOKEN }}}}
+"""
+
     return f"""# GitHub Actions CI
 # 项目: {c.projectName}
 # 工具: GitHub Actions
@@ -159,7 +176,7 @@ jobs:
 {matrix_section}    steps:
       - uses: actions/checkout@v4
         with:
-{checkout_ref}{setup_java}{setup_node}{setup_go}{setup_python}      - name: Build
+{checkout_ref}{checkout_deps_step}{setup_java}{setup_node}{setup_go}{setup_python}      - name: Build
         run: {build}
       - name: Test
         run: {test}
@@ -172,10 +189,9 @@ jobs:
 """
 
 def _build_deploy_workflow(c):
-    deploy_cmd = _get_deploy_cmd(c)
     branches = _get_branches(c)
     branch_list = ", ".join(branches)
-    
+
     # 服务器和堡垒机配置
     server_host = getattr(c, 'serverHost', '')
     server_user = getattr(c, 'serverUser', 'root')
@@ -183,12 +199,48 @@ def _build_deploy_workflow(c):
     bastion_host = getattr(c, 'bastionHost', '')
     bastion_port = getattr(c, 'bastionPort', 22)
     bastion_user = getattr(c, 'bastionUser', '')
-    
+
     # 生成 SSH 选项
     ssh_options = "-o StrictHostKeyChecking=no"
     if bastion_host and bastion_user:
         ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
-    
+
+    # Docker 部署模式：传输源码到目标服务器，docker-compose 构建运行
+    # （多阶段 Dockerfile 使构建在容器内完成，无需传输构建产物）
+    if getattr(c, 'deployMethod', 'direct') == 'docker':
+        deploy_steps = f"""      - uses: actions/checkout@v4
+      - name: Deploy with Docker
+        env:
+          SERVER_KEY: ${{{{ secrets.SERVER_SSH_KEY }}}}
+        run: |
+          mkdir -p ~/.ssh && echo "$SERVER_KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
+          tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
+              --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
+              -czf /tmp/${{PROJECT_NAME}}.tar.gz .
+          scp $SSH_OPTIONS /tmp/${{PROJECT_NAME}}.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/
+          ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST '
+              DEPLOY_DIR=$DEPLOY_PATH/${{PROJECT_NAME}}
+              mkdir -p "$DEPLOY_DIR"
+              tar -xzf /tmp/${{PROJECT_NAME}}.tar.gz -C "$DEPLOY_DIR"
+              rm -f /tmp/${{PROJECT_NAME}}.tar.gz
+              cd "$DEPLOY_DIR"
+              docker-compose down --remove-orphans 2>/dev/null || true
+              docker-compose up -d --build
+              docker image prune -f 2>/dev/null || true
+              docker-compose ps
+          '
+"""
+    else:
+        deploy_cmd = _get_deploy_cmd(c)
+        deploy_steps = f"""      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+      - name: Deploy
+        run: {deploy_cmd}
+"""
+
     return f"""# GitHub Actions Deploy
 # 项目: {c.projectName}
 # 工具: GitHub Actions
@@ -208,20 +260,14 @@ env:
   SERVER_USER: "{server_user}"
   DEPLOY_PATH: "{deploy_path}"
   SSH_OPTIONS: "{ssh_options}"
+  PROJECT_NAME: "{c.projectName}"
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     if: ${{{{ github.event.workflow_run.conclusion == 'success' }}}}
     steps:
-      - uses: actions/checkout@v4
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifact
-      - name: Deploy
-        run: {deploy_cmd}
-"""
+{deploy_steps}"""
 
 def _build_release_workflow(c):
     """生成多分支发布流程 workflow（审批 + 合并 + 回滚）"""

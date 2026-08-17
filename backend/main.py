@@ -44,6 +44,16 @@ class AppServerConfig(BaseModel):
     contextPath: str = "/app"   # 应用上下文路径
 
 
+class DependencyRepoConfig(BaseModel):
+    """依赖仓库配置（独立代码库存放项目依赖）"""
+    url: str = ""               # 依赖仓库地址（git URL）
+    branch: str = "main"        # 分支
+    authType: str = "password"  # password | sshKey
+    username: str = ""
+    password: str = ""
+    sshKey: str = ""
+
+
 class PipelineConfig(BaseModel):
     tool: str
     projectType: str
@@ -58,6 +68,7 @@ class PipelineConfig(BaseModel):
     appServer: Optional[AppServerConfig] = None
     releaseStrategy: Optional[dict] = None  # 发布策略
     useChinaMirror: bool = False  # 是否使用国内镜像（用于国产 OS 或国内网络环境）
+    dependencyRepo: Optional[DependencyRepoConfig] = None  # 独立依赖仓库
 
 
 class ReleaseStrategy(BaseModel):
@@ -84,14 +95,6 @@ class ServerConfig(BaseModel):
     sshKey: str = ""
     deployPath: str = "/opt/apps"
     backupBeforeDeploy: bool = True  # 部署前备份旧版本
-    # 堡垒机/跳板机配置（用于生成的 Pipeline 穿透访问）
-    useBastion: bool = False        # 是否启用堡垒机跳转
-    bastionHost: str = ""           # 堡垒机地址
-    bastionPort: int = 22           # 堡垒机端口
-    bastionUser: str = ""           # 堡垒机用户名
-    bastionAuthType: str = "password"  # password | sshKey
-    bastionPassword: str = ""       # 堡垒机密码
-    bastionSshKey: str = ""         # 堡垒机 SSH 密钥
 
 
 class RelayServerConfig(BaseModel):
@@ -165,6 +168,7 @@ class AutoDeployConfig(BaseModel):
     appServer: Optional[AppServerConfig] = None
     releaseStrategy: Optional[dict] = None  # 发布策略
     useChinaMirror: bool = False  # 是否使用国内镜像（用于国产 OS 或国内网络环境）
+    dependencyRepo: Optional[DependencyRepoConfig] = None  # 独立依赖仓库
 
 
 @app.get("/api/tools")

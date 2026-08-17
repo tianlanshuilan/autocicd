@@ -6,6 +6,8 @@ def generate_gitlab(config, output_dir):
         files.append({"name": "Dockerfile", "content": dockerfile})
         dockerignore = _build_dockerignore(config)
         files.append({"name": ".dockerignore", "content": dockerignore})
+        from generators.docker import build_docker_compose
+        files.append({"name": "docker-compose.yml", "content": build_docker_compose(config)})
 
     # 多分支发布流程文件
     from generators.workflow import is_multi_branch_workflow, build_rollback_script, build_release_readme
@@ -34,21 +36,23 @@ def _get_image(c):
     return "alpine:latest"
 
 def _get_build_script(c):
+    from generators.offline import maven_build_cmd, npm_build_cmd, pip_install_cmd, go_build_cmd
     if c.projectType == "java-maven":
-        return "mvn clean package -DskipTests"
+        return maven_build_cmd(c)
     elif c.projectType == "java-gradle":
         return "gradle bootJar --no-daemon"
     elif c.projectType in ("vue", "react"):
-        return "npm ci && npm run build"
+        return npm_build_cmd(c)
     elif c.projectType == "python":
-        return "pip install -r requirements.txt"
+        return pip_install_cmd(c)
     elif c.projectType == "go":
-        return "CGO_ENABLED=0 go build -o app ."
+        return go_build_cmd(c, cgo_disabled=True)
     return "echo build"
 
 def _get_test_script(c):
+    from generators.offline import maven_test_cmd
     if c.projectType == "java-maven":
-        return "mvn test"
+        return maven_test_cmd(c)
     elif c.projectType == "java-gradle":
         return "gradle test"
     elif c.projectType in ("vue", "react"):
@@ -83,6 +87,18 @@ def _get_deploy_cmd(c):
         return "./app"
     return "echo deploy"
 
+def _get_deploy_scripts(c):
+    """返回部署脚本行列表。Docker 模式传输源码到目标服务器并 docker-compose 构建运行。"""
+    if getattr(c, 'deployMethod', 'direct') == 'docker':
+        return [
+            "echo 'Deploying with Docker...'",
+            "tar --exclude='.git' --exclude='node_modules' --exclude='target' --exclude='build' --exclude='dist' --exclude='.dep-repo' -czf /tmp/$CI_PROJECT_NAME.tar.gz .",
+            "scp $SSH_OPTIONS /tmp/$CI_PROJECT_NAME.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/",
+            "ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST 'DEPLOY_DIR=$DEPLOY_PATH/$CI_PROJECT_NAME; mkdir -p $DEPLOY_DIR; tar -xzf /tmp/$CI_PROJECT_NAME.tar.gz -C $DEPLOY_DIR; rm -f /tmp/$CI_PROJECT_NAME.tar.gz; cd $DEPLOY_DIR; docker-compose down --remove-orphans 2>/dev/null || true; docker-compose up -d --build; docker image prune -f 2>/dev/null || true; docker-compose ps'",
+            "rm -f /tmp/$CI_PROJECT_NAME.tar.gz",
+        ]
+    return [_get_deploy_cmd(c)]
+
 def _get_branches(c):
     """获取分支列表，兼容单分支和多分支"""
     branches = getattr(c, 'branches', None)
@@ -95,7 +111,7 @@ def _build_pipeline(c):
     build_script = _get_build_script(c)
     test_script = _get_test_script(c)
     artifacts_path = _get_artifacts_path(c)
-    deploy_cmd = _get_deploy_cmd(c)
+    deploy_block = "\n".join(f"    - {s}" for s in _get_deploy_scripts(c))
     branches = _get_branches(c)
     
     # 服务器和堡垒机配置
@@ -124,6 +140,17 @@ def _build_pipeline(c):
         build_step = "echo '纯代码模式，跳过构建'"
 
     branch_list = ", ".join(branches)
+
+    # 依赖仓库配置
+    from generators.offline import has_dep_repo, dep_repo_url, dep_repo_branch
+    dep_repo_vars = ""
+    dep_repo_before = ""
+    if has_dep_repo(c):
+        dep_repo_vars = f"""  DEP_REPO_URL: "{dep_repo_url(c)}"
+  DEP_REPO_BRANCH: "{dep_repo_branch(c)}"
+"""
+        dep_repo_before = f"""    - git clone --branch $DEP_REPO_BRANCH --depth 1 $DEP_REPO_URL .dep-repo
+"""
 
     # 多分支时生成并行 job
     if len(branches) > 1:
@@ -164,7 +191,7 @@ deploy_{safe_name}:
   variables:
     BRANCH: "{b}"
   script:
-    - {deploy_cmd}
+{deploy_block}
   only:
     - {b}
 """
@@ -187,7 +214,7 @@ variables:
   SERVER_USER: "{server_user}"
   DEPLOY_PATH: "{deploy_path}"
   SSH_OPTIONS: "{ssh_options}"
-{parallel_jobs}"""
+{dep_repo_vars}{parallel_jobs}"""
 
     return f"""# GitLab CI Pipeline
 # 项目: {c.projectName}
@@ -209,11 +236,12 @@ variables:
   SERVER_USER: "{server_user}"
   DEPLOY_PATH: "{deploy_path}"
   SSH_OPTIONS: "{ssh_options}"
-
+{dep_repo_vars}
 build_job:
   stage: build
   image: {image}
-  script:
+  before_script:
+{dep_repo_before}  script:
     - {build_step}
   artifacts:
     paths:
@@ -230,7 +258,7 @@ deploy_job:
   stage: deploy
   image: {image}
   script:
-    - {deploy_cmd}
+{deploy_block}
   only:
     - {branches[0]}
 """

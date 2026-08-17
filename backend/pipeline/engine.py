@@ -40,6 +40,7 @@ class PipelineEngine:
         self.generated_files = []
         self.git_ops = None
         self.ssh_ops = None
+        self.jump_chain = []  # 已解析的跳转链路（复用给部署目标连接）
         self._ws_send = None
         self._credential_waiter = None
 
@@ -228,6 +229,217 @@ class PipelineEngine:
             await self.send_message(step, "failed", str(e))
             return {"step": step, "status": "failed", "message": str(e)}
 
+    def _bundle_dependencies_sync(self, log) -> bool:
+        """依赖离线构建支持（三种模式）
+
+        模式 A（预拉取）：按 BOM 原始地址拉取依赖到 .offline-deps/
+        模式 B（本地检测）：检测仓库中已存在的依赖文件（开发者已提交）
+        模式 C（独立仓库）：从独立依赖仓库克隆并检测
+        """
+        import subprocess
+
+        project_type = self.config.get("projectType", "")
+        work_dir = getattr(self.git_ops, "work_dir", None) if self.git_ops else None
+        if not work_dir or not os.path.isdir(work_dir):
+            log("仓库尚未克隆，跳过依赖处理")
+            return False
+
+        # ===== 模式 C：从独立依赖仓库克隆 =====
+        dep_repo_config = self.config.get("dependencyRepo", {})
+        dep_repo_url = dep_repo_config.get("url", "") if dep_repo_config else ""
+        if dep_repo_url:
+            log(f"检测到独立依赖仓库配置: {dep_repo_url}")
+            dep_repo_dir = os.path.join(work_dir, ".dep-repo")
+            if self._clone_dependency_repo(dep_repo_config, dep_repo_dir, log):
+                detected_path = self._detect_local_dependencies(project_type, dep_repo_dir, log)
+                if detected_path:
+                    log(f"✅ 在依赖仓库中检测到: {detected_path}")
+                    log("   流水线将从依赖仓库获取依赖进行离线构建")
+                    # 设置配置，让生成器知道依赖在 .dep-repo/<detected_path>
+                    self.config["detectedDepsPath"] = f".dep-repo/{detected_path}"
+                    self.config["depRepoUrl"] = dep_repo_url
+                    self.config["depRepoBranch"] = dep_repo_config.get("branch", "main")
+                    return True
+                else:
+                    log(f"⚠️ 依赖仓库中未检测到 {project_type} 类型的依赖文件")
+            else:
+                log("⚠️ 依赖仓库克隆失败，跳过依赖处理")
+
+        # ===== 模式 B：检测本地已存在的依赖 =====
+        detected_path = self._detect_local_dependencies(project_type, work_dir, log)
+        if detected_path:
+            log(f"✅ 检测到仓库中已存在依赖文件: {detected_path}")
+            log("   流水线将直接使用本地依赖进行离线构建")
+            # 写入标记文件，告知生成器使用检测到的路径
+            marker = os.path.join(work_dir, ".offline-deps", "LOCAL-DEPS-DETECTED.txt")
+            os.makedirs(os.path.dirname(marker), exist_ok=True)
+            with open(marker, "w") as f:
+                f.write(f"detected_path={detected_path}\nproject_type={project_type}\n")
+            # 设置配置，让生成器使用检测到的路径
+            self.config["detectedDepsPath"] = detected_path
+            return True
+
+        # ===== 模式 A：从 BOM 地址预拉取 =====
+        log("未检测到本地依赖，尝试从 BOM 地址预拉取...")
+        return self._pull_dependencies_from_bom(project_type, work_dir, log)
+
+    def _clone_dependency_repo(self, dep_repo_config: dict, target_dir: str, log) -> bool:
+        """克隆独立依赖仓库到指定目录"""
+        import subprocess
+        
+        url = dep_repo_config.get("url", "")
+        branch = dep_repo_config.get("branch", "main")
+        auth_type = dep_repo_config.get("authType", "password")
+        username = dep_repo_config.get("username", "")
+        password = dep_repo_config.get("password", "")
+        ssh_key = dep_repo_config.get("sshKey", "")
+        
+        if not url:
+            return False
+        
+        # 清理目标目录
+        if os.path.exists(target_dir):
+            import shutil
+            shutil.rmtree(target_dir)
+        
+        # 构建克隆 URL（密码认证时嵌入凭据）
+        clone_url = url
+        if auth_type == "password" and username and password:
+            # 将 https://github.com/org/repo.git 转为 https://user:pass@github.com/org/repo.git
+            if url.startswith("https://"):
+                clone_url = url.replace("https://", f"https://{username}:{password}@")
+        
+        log(f"   正在克隆依赖仓库 (分支: {branch})...")
+        try:
+            result = subprocess.run(
+                ["git", "clone", "--branch", branch, "--depth", "1", clone_url, target_dir],
+                capture_output=True, text=True, timeout=300
+            )
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()[-300:]
+                log(f"   ❌ 依赖仓库克隆失败: {err}")
+                return False
+            log(f"   ✅ 依赖仓库克隆成功")
+            return True
+        except subprocess.TimeoutExpired:
+            log("   ❌ 依赖仓库克隆超时（超过 5 分钟）")
+            return False
+        except Exception as e:
+            log(f"   ❌ 依赖仓库克隆异常: {e}")
+            return False
+
+    def _detect_local_dependencies(self, project_type: str, work_dir: str, log) -> str:
+        """检测仓库中是否已存在依赖文件（开发者已提交）
+        
+        Returns: 检测到的依赖路径（相对于 work_dir），未检测到返回空字符串
+        """
+        # 各类型项目可能的本地依赖目录
+        checks = {
+            "java-maven": [
+                ("maven-repo", "Maven 本地仓库"),
+                (".m2/repository", "Maven .m2 仓库"),
+                ("lib", "lib 依赖目录"),
+            ],
+            "java-gradle": [
+                ("gradle-cache", "Gradle 缓存"),
+                ("lib", "lib 依赖目录"),
+            ],
+            "vue": [
+                ("node_modules", "node_modules"),
+                ("npm-cache", "npm 离线缓存"),
+            ],
+            "react": [
+                ("node_modules", "node_modules"),
+                ("npm-cache", "npm 离线缓存"),
+            ],
+            "python": [
+                ("pip-packages", "pip 离线包"),
+                ("wheels", "Python wheels"),
+                ("requirements-local", "本地依赖目录"),
+            ],
+            "go": [
+                ("vendor", "Go vendor 目录"),
+            ],
+        }
+
+        paths = checks.get(project_type, [])
+        for path, desc in paths:
+            full_path = os.path.join(work_dir, path)
+            if os.path.exists(full_path) and os.path.isdir(full_path):
+                # 检查目录是否非空
+                if os.listdir(full_path):
+                    log(f"   检测到 {desc}: {path}/")
+                    return path
+        
+        return ""
+
+    def _pull_dependencies_from_bom(self, project_type: str, work_dir: str, log) -> bool:
+        """从 BOM 声明的原始地址预拉取依赖到 .offline-deps/"""
+        import subprocess
+
+        deps_dir = os.path.join(work_dir, ".offline-deps")
+        os.makedirs(deps_dir, exist_ok=True)
+
+        # 项目类型 → (所需工具, 拉取命令)；命令为 None 表示暂不支持
+        tasks = {
+            "java-maven": ("mvn", ["mvn", "-q", "-B", "dependency:go-offline",
+                                   f"-Dmaven.repo.local={os.path.join(deps_dir, 'maven-repo')}"]),
+            "java-gradle": ("gradle", None),
+            "vue": ("npm", ["npm", "ci", "--cache", os.path.join(deps_dir, "npm-cache")]),
+            "react": ("npm", ["npm", "ci", "--cache", os.path.join(deps_dir, "npm-cache")]),
+            "python": ("pip3", ["pip3", "download", "-r", "requirements.txt",
+                                "-d", os.path.join(deps_dir, "pip-packages")]),
+            "go": ("go", ["go", "mod", "vendor"]),
+        }
+
+        task = tasks.get(project_type)
+        if not task:
+            log(f"项目类型 {project_type} 不支持依赖预拉取")
+            return False
+        tool_name, cmd = task
+        if cmd is None:
+            log("Gradle 项目暂不支持将依赖缓存提交到仓库，流水线保持在线模式")
+            return False
+
+        if not shutil.which(tool_name):
+            log(f"⚠️ 本机未安装 {tool_name}，无法预拉取依赖，流水线保持在线模式构建")
+            return False
+
+        # 校验 BOM 文件存在
+        bom_files = {"java-maven": "pom.xml", "vue": "package-lock.json", "react": "package-lock.json",
+                     "python": "requirements.txt", "go": "go.mod"}
+        bom = bom_files.get(project_type)
+        if bom and not os.path.exists(os.path.join(work_dir, bom)):
+            log(f"⚠️ 仓库中未找到 {bom}，跳过依赖预拉取")
+            return False
+
+        log(f"执行依赖拉取: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd, cwd=work_dir, capture_output=True, text=True, timeout=1800
+            )
+            if result.returncode != 0:
+                err = (result.stderr or result.stdout or "").strip()[-500:]
+                log(f"❌ 依赖拉取失败: {err}")
+                return False
+        except subprocess.TimeoutExpired:
+            log("❌ 依赖拉取超时（超过 30 分钟）")
+            return False
+        except Exception as e:
+            log(f"❌ 依赖拉取异常: {e}")
+            return False
+
+        # 写入说明文件，便于流水线与使用者识别离线依赖包
+        with open(os.path.join(deps_dir, "OFFLINE-DEPS.txt"), "w") as f:
+            f.write(
+                "本目录由 auto-cicd 平台预拉取生成，用于内网离线构建。\n"
+                f"项目类型: {project_type}\n"
+                "依赖按 BOM 声明的原始地址拉取，未修改任何依赖地址。\n"
+                "流水线构建时以离线模式使用本目录，无需外网访问。\n"
+            )
+        log("✅ 依赖预拉取完成（.offline-deps/），将随代码推送到仓库")
+        return True
+
     async def _step_generate_config(self) -> dict:
         """Step 2: 生成 CI/CD 配置文件"""
         step = "generate_config"
@@ -254,6 +466,25 @@ class PipelineEngine:
             if not generator:
                 raise ValueError(f"不支持的工具: {self.config['tool']}")
 
+            # 自动检测本地依赖（依赖即代码模式）
+            self.config["depsBundled"] = False
+            self.config["detectedDepsPath"] = ""
+            await self.send_message(step, "running", "正在检测仓库中的本地依赖...")
+            log_cb = self._sync_log_factory(step)
+            loop_bg = asyncio.get_event_loop()
+            bundled = await loop_bg.run_in_executor(
+                None, lambda: self._bundle_dependencies_sync(log_cb)
+            )
+            self.config["depsBundled"] = bundled
+            if bundled:
+                detected_path = self.config.get("detectedDepsPath", "")
+                if detected_path:
+                    await self.send_message(step, "running", f"✅ 检测到本地依赖: {detected_path}，流水线将以离线模式构建")
+                else:
+                    await self.send_message(step, "running", "✅ 依赖预拉取完成，将随代码推送到仓库，流水线以离线模式构建")
+            else:
+                await self.send_message(step, "running", "未检测到本地依赖，生成的流水线将保持在线模式构建")
+
             output_dir = os.path.join(self.work_dir, "config_output")
             os.makedirs(output_dir, exist_ok=True)
 
@@ -272,17 +503,35 @@ class PipelineEngine:
                 setattr(cfg, 'serverUser', server_config.get('username', 'root'))
                 setattr(cfg, 'deployPath', server_config.get('deployPath', '/opt/apps'))
                 setattr(cfg, 'backupBeforeDeploy', server_config.get('backupBeforeDeploy', True))
-                # 堡垒机配置（用于生成的 Pipeline 穿透访问，仅在启用开关时生效）
-                if server_config.get('useBastion', False):
-                    setattr(cfg, 'bastionHost', server_config.get('bastionHost', ''))
-                    setattr(cfg, 'bastionPort', server_config.get('bastionPort', 22))
-                    setattr(cfg, 'bastionUser', server_config.get('bastionUser', ''))
-                    setattr(cfg, 'bastionAuthType', server_config.get('bastionAuthType', 'password'))
-                    setattr(cfg, 'bastionPassword', server_config.get('bastionPassword', ''))
-                    setattr(cfg, 'bastionSshKey', server_config.get('bastionSshKey', ''))
-                else:
-                    setattr(cfg, 'bastionHost', '')
-                    setattr(cfg, 'bastionUser', '')
+
+            # 从 networkAccess.hops 中提取堡垒机信息（用于生成的 Pipeline 穿透访问）
+            network_access = self.config.get("networkAccess", {})
+            hops = network_access.get("hops", [])
+            bastion_host = ""
+            bastion_port = 22
+            bastion_user = ""
+            bastion_auth_type = "password"
+            bastion_password = ""
+            bastion_ssh_key = ""
+            
+            # 查找第一个 bastion 类型的 hop
+            for hop in hops:
+                if hop.get("type") == "bastion":
+                    bastion_host = hop.get("host", "")
+                    bastion_port = hop.get("port", 22)
+                    bastion_user = hop.get("username", "")
+                    bastion_auth_type = hop.get("authType", "password")
+                    bastion_password = hop.get("password", "")
+                    bastion_ssh_key = hop.get("sshKey", "")
+                    break
+            
+            # 设置堡垒机字段（供生成器使用）
+            setattr(cfg, 'bastionHost', bastion_host)
+            setattr(cfg, 'bastionPort', bastion_port)
+            setattr(cfg, 'bastionUser', bastion_user)
+            setattr(cfg, 'bastionAuthType', bastion_auth_type)
+            setattr(cfg, 'bastionPassword', bastion_password)
+            setattr(cfg, 'bastionSshKey', bastion_ssh_key)
 
             loop = asyncio.get_event_loop()
             self.generated_files = await loop.run_in_executor(
@@ -504,6 +753,9 @@ class PipelineEngine:
                 "credential": relay_cred,
             })
 
+        # 保存已解析的链路，供部署目标服务器连接复用
+        self.jump_chain = jump_chain
+
         # 生成连接日志
         if jump_chain:
             hop_labels = [f"{h['type']}({h['host']})" for h in jump_chain]
@@ -581,11 +833,87 @@ class PipelineEngine:
             )
 
             await self.send_message(step, "success", f"{tool_name} 安装完成")
+
+            # 在部署目标服务器上准备项目运行环境（Docker 或语言运行时）
+            await self._prepare_target_runtime(use_china_mirror)
+
             return {"step": step, "status": "success", "message": f"{tool_name} 已安装"}
 
         except SSHError as e:
             await self.send_message(step, "failed", str(e))
             return {"step": step, "status": "failed", "message": str(e)}
+
+    async def _prepare_target_runtime(self, use_china_mirror: bool = False):
+        """在部署目标服务器上准备项目运行环境
+
+        - deployMethod=docker：安装/检查 Docker + docker-compose
+        - deployMethod=direct/app_server：按项目类型安装 Java/Node/Python/Go 运行时
+
+        工具装在目标服务器时复用当前连接；专用工具服务器模式下
+        单独通过跳转链路连接部署目标服务器。运行环境准备失败不阻断
+        整体流程（记录警告，用户可手动处理）。
+        """
+        step = "install_tool"
+        deploy_method = self.config.get("deployMethod", "direct")
+        project_type = self.config.get("projectType", "")
+
+        runtime_desc = "Docker 环境" if deploy_method == "docker" else f"{project_type} 运行环境"
+        await self.send_message(step, "running", f"正在准备部署服务器{runtime_desc}...")
+
+        log_cb = self._sync_log_factory(step)
+        loop = asyncio.get_event_loop()
+
+        tool_deploy = self.config.get("toolDeploy", "target")
+        tool_server = self.config.get("toolServer", {}) or {}
+        use_dedicated = (tool_deploy == "dedicated" and tool_server.get("host"))
+
+        try:
+            if not use_dedicated:
+                # 工具与部署目标同一台服务器，复用当前连接
+                await loop.run_in_executor(
+                    None,
+                    lambda: self.ssh_ops.prepare_deploy_runtime(
+                        deploy_method, project_type, self.config, use_china_mirror, log_cb)
+                )
+            else:
+                # 专用工具服务器：单独连接部署目标服务器
+                server = self.config.get("server", {})
+                server_cred = {
+                    "authType": server.get("authType", "password"),
+                    "password": server.get("password", ""),
+                    "sshKey": server.get("sshKey", ""),
+                }
+                if server_cred["authType"] == "password" and not server_cred["password"]:
+                    cred = await self.request_credential("server", f"需要部署目标服务器 {server.get('host')} 密码")
+                    if cred:
+                        server_cred.update(cred)
+                if server_cred["authType"] in ("ssh_key", "sshKey") and not server_cred["sshKey"]:
+                    cred = await self.request_credential("server", f"需要部署目标服务器 {server.get('host')} SSH 密钥")
+                    if cred:
+                        server_cred.update(cred)
+
+                target_ops = SSHOps(
+                    host=server.get("host", ""),
+                    port=server.get("port", 22),
+                    username=server.get("username", "root"),
+                    credential=server_cred,
+                    jump_chain=self.jump_chain,
+                )
+                try:
+                    await loop.run_in_executor(None, lambda: target_ops.connect(log_cb))
+                    await loop.run_in_executor(
+                        None,
+                        lambda: target_ops.prepare_deploy_runtime(
+                            deploy_method, project_type, self.config, use_china_mirror, log_cb)
+                    )
+                finally:
+                    target_ops.close()
+
+            await self.send_message(step, "success", f"部署服务器{runtime_desc}准备完成")
+
+        except SSHError as e:
+            # 运行环境准备失败不阻断流程，记录警告
+            await self.send_message(step, "running", f"⚠️ 运行环境准备失败（{e}），部署前请确认目标服务器环境")
 
     async def _step_configure_pipeline(self) -> dict:
         """Step 7: 配置流水线（创建 Job、设置凭据、配置 Webhook）"""

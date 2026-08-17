@@ -11,6 +11,8 @@ def generate_jenkins(config, output_dir):
         files.append({"name": "Dockerfile", "content": dockerfile})
         dockerignore = _build_dockerignore(config)
         files.append({"name": ".dockerignore", "content": dockerignore})
+        from generators.docker import build_docker_compose
+        files.append({"name": "docker-compose.yml", "content": build_docker_compose(config)})
 
     # 项目基础文件
     if config.projectType.startswith("java"):
@@ -54,6 +56,12 @@ def _build_jenkinsfile(c):
         return _build_multibranch_jenkinsfile(c, branches)
 
     stages = []
+
+    # 如果配置了独立依赖仓库，先克隆依赖仓库
+    from generators.offline import has_dep_repo, dep_repo_url, dep_repo_branch
+    if has_dep_repo(c):
+        stages.append(_build_checkout_deps_stage(c))
+
     # Auto-determine build stages based on project type
     if c.projectType.startswith("java"):
         stages.append(_build_build_stage(c))  # Maven/Gradle build
@@ -85,6 +93,13 @@ def _build_jenkinsfile(c):
     if bastion_host and bastion_user:
         ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
 
+    # 依赖仓库环境变量
+    dep_repo_env = ""
+    if has_dep_repo(c):
+        dep_repo_env = f"""
+        DEP_REPO_URL = '{dep_repo_url(c)}'
+        DEP_REPO_BRANCH = '{dep_repo_branch(c)}'"""
+
     env_block = f"""    environment {{
         PROJECT_NAME = '{c.projectName}'
         REPO_URL = '{c.repoUrl}'
@@ -93,7 +108,7 @@ def _build_jenkinsfile(c):
         SERVER_HOST = '{server_host}'
         SERVER_USER = '{server_user}'
         DEPLOY_PATH = '{deploy_path}'
-        SSH_OPTIONS = '{ssh_options}'
+        SSH_OPTIONS = '{ssh_options}'{dep_repo_env}
     }}"""
 
     return f"""// Jenkins Pipeline - {c.projectName}
@@ -238,13 +253,26 @@ def _indent_stages(text, level):
     lines = text.split("\n")
     return "\n".join(prefix + line if line.strip() else line for line in lines)
 
+def _build_checkout_deps_stage(c):
+    """生成克隆依赖仓库的阶段"""
+    from generators.offline import dep_repo_url, dep_repo_branch
+    return f"""        stage('Checkout Dependencies') {{
+            steps {{
+                echo 'Cloning dependency repository...'
+                dir('.dep-repo') {{
+                    git url: "${{DEP_REPO_URL}}", branch: "${{DEP_REPO_BRANCH}}", credentialsId: 'dep-repo-cred'
+                }}
+            }}
+        }}"""
+
 def _build_build_stage(c):
+    from generators.offline import maven_build_cmd, npm_install_cmd, pip_install_cmd, go_build_cmd
     if c.projectType == "java-maven":
-        return """        stage('Build') {
-            steps {
-                sh 'mvn clean package -DskipTests'
-            }
-        }"""
+        return f"""        stage('Build') {{
+            steps {{
+                sh '{maven_build_cmd(c)}'
+            }}
+        }}"""
     elif c.projectType == "java-gradle":
         return """        stage('Build') {
             steps {
@@ -252,34 +280,36 @@ def _build_build_stage(c):
             }
         }"""
     elif c.projectType in ("vue", "react"):
-        return """        stage('Build') {
-            steps {
-                sh 'npm ci'
+        return f"""        stage('Build') {{
+            steps {{
+                sh '{npm_install_cmd(c)}'
                 sh 'npm run build'
-            }
-        }"""
+            }}
+        }}"""
     elif c.projectType == "python":
-        return """        stage('Build') {
-            steps {
-                sh 'pip install -r requirements.txt'
-            }
-        }"""
+        return f"""        stage('Build') {{
+            steps {{
+                sh '{pip_install_cmd(c)}'
+            }}
+        }}"""
     elif c.projectType == "go":
-        return """        stage('Build') {
-            steps {
-                sh 'go build -o app .'
-            }
-        }"""
+        return f"""        stage('Build') {{
+            steps {{
+                sh '{go_build_cmd(c)}'
+            }}
+        }}"""
     return ""
 
 def _build_artifact_stage(c):
+    from generators.offline import npm_install_cmd, pip_install_cmd, go_build_cmd
     if c.projectType == "java-maven":
-        return """        stage('Build & Package') {
-            steps {
-                sh 'mvn package -DskipTests'
+        from generators.offline import maven_build_cmd
+        return f"""        stage('Build & Package') {{
+            steps {{
+                sh '{maven_build_cmd(c)}'
                 archiveArtifacts artifacts: 'target/*.jar', fingerprint: true
-            }
-        }"""
+            }}
+        }}"""
     elif c.projectType == "java-gradle":
         return """        stage('Build & Package') {
             steps {
@@ -288,24 +318,24 @@ def _build_artifact_stage(c):
             }
         }"""
     elif c.projectType in ("vue", "react"):
-        return """        stage('Build & Package') {
-            steps {
-                sh 'npm ci'
+        return f"""        stage('Build & Package') {{
+            steps {{
+                sh '{npm_install_cmd(c)}'
                 sh 'npm run build'
-            }
-        }"""
+            }}
+        }}"""
     elif c.projectType == "python":
-        return """        stage('Build & Package') {
-            steps {
-                sh 'pip install -r requirements.txt -t build/'
-            }
-        }"""
+        return f"""        stage('Build & Package') {{
+            steps {{
+                sh '{pip_install_cmd(c, "build/")}'
+            }}
+        }}"""
     elif c.projectType == "go":
-        return """        stage('Build & Package') {
-            steps {
-                sh 'CGO_ENABLED=0 go build -o app .'
-            }
-        }"""
+        return f"""        stage('Build & Package') {{
+            steps {{
+                sh '{go_build_cmd(c, cgo_disabled=True)}'
+            }}
+        }}"""
     return ""
 
 def _build_code_stage(c):
@@ -316,12 +346,13 @@ def _build_code_stage(c):
         }"""
 
 def _build_test_stage(c):
+    from generators.offline import maven_test_cmd
     if c.projectType == "java-maven":
-        return """        stage('Test') {
-            steps {
-                sh 'mvn test'
-            }
-        }"""
+        return f"""        stage('Test') {{
+            steps {{
+                sh '{maven_test_cmd(c)}'
+            }}
+        }}"""
     elif c.projectType == "java-gradle":
         return """        stage('Test') {
             steps {
@@ -350,9 +381,16 @@ def _build_test_stage(c):
 
 def _build_deploy_stage(c):
     """生成部署阶段（包含备份、部署、启动）"""
+    # Docker 部署模式：目标服务器上构建并运行容器
+    if getattr(c, 'deployMethod', 'direct') == 'docker':
+        return _build_docker_deploy_stage(c)
+
+    from generators.offline import pip_install_cmd
     server_host = getattr(c, 'serverHost', '${SERVER_HOST}')
     deploy_path = getattr(c, 'deployPath', '/opt/apps')
     backup_enabled = getattr(c, 'backupBeforeDeploy', True)
+    # Python 目标机安装依赖（scp 会把 .offline-deps 一并传到目标机）
+    pip_remote_cmd = pip_install_cmd(c) + " -q"
 
     # 备份步骤
     backup_step = ""
@@ -448,7 +486,7 @@ def _build_deploy_stage(c):
                     scp ${{SSH_OPTIONS}} -r . ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
                     ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
-                        pip install -r requirements.txt -q
+                        {pip_remote_cmd}
                         nohup python app.py > app.log 2>&1 &
                         echo "应用已启动，端口: {c.port}"
                     '''
@@ -476,6 +514,44 @@ def _build_deploy_stage(c):
             }}
         }}"""
     return ""
+
+def _build_docker_deploy_stage(c):
+    """生成 Docker 部署阶段：传输源码到目标服务器，docker-compose 构建并运行容器。
+
+    Dockerfile 为多阶段构建，构建过程完全在容器内进行，
+    目标服务器只需 Docker + docker-compose 环境，无需 JDK/Node 等构建工具。
+    """
+    deploy_path = getattr(c, 'deployPath', '/opt/apps')
+    return f"""        stage('Deploy') {{
+            steps {{
+                script {{
+                    echo '部署到目标服务器（Docker 模式）...'
+                    // 打包源码（排除构建产物与缓存），传输到目标服务器
+                    sh '''
+                        tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
+                            --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
+                            -czf /tmp/${{PROJECT_NAME}}.tar.gz .
+                        scp ${{SSH_OPTIONS}} /tmp/${{PROJECT_NAME}}.tar.gz ${{SERVER_USER}}@${{SERVER_HOST}}:/tmp/
+                        rm -f /tmp/${{PROJECT_NAME}}.tar.gz
+                    '''
+                    // 在目标服务器解压并用 docker-compose 构建运行
+                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                        DEPLOY_DIR={deploy_path}/${{PROJECT_NAME}}
+                        mkdir -p "$DEPLOY_DIR"
+                        tar -xzf /tmp/${{PROJECT_NAME}}.tar.gz -C "$DEPLOY_DIR"
+                        rm -f /tmp/${{PROJECT_NAME}}.tar.gz
+                        cd "$DEPLOY_DIR"
+                        echo "停止旧容器..."
+                        docker-compose down --remove-orphans 2>/dev/null || true
+                        echo "构建并启动容器..."
+                        docker-compose up -d --build
+                        docker image prune -f 2>/dev/null || true
+                        echo "容器状态:"
+                        docker-compose ps
+                    '''
+                }}
+            }}
+        }}"""
 
 def _build_dockerfile(c):
     if c.projectType == "java-maven":

@@ -170,12 +170,8 @@
         <section class="section" v-if="mode === 'generate'">
           <h3>4. 项目信息</h3>
           <div class="form-group">
-            <label>项目仓库 URL</label>
-            <input v-model="form.repoUrl" placeholder="https://github.com/owner/repo" />
-          </div>
-          <div class="form-group">
-            <label>项目名</label>
-            <input v-model="form.projectName" placeholder="my-project" />
+            <label>代码仓库地址</label>
+            <input v-model="form.repoUrl" placeholder="https://github.com/owner/repo.git" />
           </div>
 
           <!-- 默认分支 -->
@@ -221,12 +217,8 @@
             <section class="section auto-info-col auto-info-left">
               <h3>4. 项目信息</h3>
               <div class="form-group">
-                <label>项目仓库 URL</label>
-                <input v-model="form.repoUrl" placeholder="https://github.com/owner/repo" />
-              </div>
-              <div class="form-group">
-                <label>项目名</label>
-                <input v-model="form.projectName" placeholder="my-project" />
+                <label>代码仓库地址</label>
+                <input v-model="form.repoUrl" placeholder="https://github.com/owner/repo.git" />
               </div>
               <div class="form-group">
                 <label>
@@ -338,56 +330,42 @@
                   </span>
                 </label>
               </div>
-              
-              <!-- 堡垒机/跳板机配置 -->
-              <div class="form-group bastion-section">
+
+              <!-- 依赖仓库配置 -->
+              <div class="form-group">
                 <label class="section-label">
-                  <span>🛡️ 堡垒机/跳板机（可选）</span>
-                  <span class="section-hint">Pipeline 执行时通过堡垒机访问目标服务器</span>
+                  <span>📦 依赖仓库（可选）</span>
+                  <span class="section-hint">独立的依赖代码仓库，存放项目所需的离线依赖文件</span>
                 </label>
-                <div class="bastion-toggle">
-                  <label class="checkbox-label">
-                    <input type="checkbox" v-model="form.server.useBastion" />
-                    <span class="checkmark"></span>
-                    <span class="check-text">
-                      <span class="check-title">启用堡垒机跳转</span>
-                      <span class="check-desc">目标服务器在堡垒机/零信任网络内，需要通过堡垒机穿透访问</span>
-                    </span>
-                  </label>
+                <input v-model="form.dependencyRepo.url" placeholder="依赖仓库地址，如 git@github.com:org/project-deps.git" />
+                <div class="form-row" v-if="form.dependencyRepo.url">
+                  <div class="form-group">
+                    <label>分支</label>
+                    <input v-model="form.dependencyRepo.branch" placeholder="main" />
+                  </div>
+                  <div class="form-group">
+                    <label>认证方式</label>
+                    <select v-model="form.dependencyRepo.authType">
+                      <option value="password">密码</option>
+                      <option value="sshKey">SSH 密钥</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="form-row" v-if="form.dependencyRepo.url && form.dependencyRepo.authType === 'password'">
+                  <div class="form-group">
+                    <label>用户名</label>
+                    <input v-model="form.dependencyRepo.username" placeholder="git 用户名" />
+                  </div>
+                  <div class="form-group">
+                    <label>密码/Token</label>
+                    <input v-model="form.dependencyRepo.password" type="password" placeholder="可留空，执行时弹窗输入" />
+                  </div>
+                </div>
+                <div class="form-group" v-if="form.dependencyRepo.url && form.dependencyRepo.authType === 'sshKey'">
+                  <label>SSH 私钥</label>
+                  <textarea v-model="form.dependencyRepo.sshKey" rows="3" placeholder="粘贴 SSH 私钥内容"></textarea>
                 </div>
               </div>
-              
-              <template v-if="form.server.useBastion">
-                <div class="form-row">
-                  <div class="form-group">
-                    <label>堡垒机地址</label>
-                    <input v-model="form.server.bastionHost" placeholder="bastion.example.com" />
-                  </div>
-                  <div class="form-group">
-                    <label>堡垒机端口</label>
-                    <input v-model.number="form.server.bastionPort" type="number" placeholder="22" />
-                  </div>
-                </div>
-                <div class="form-group">
-                  <label>堡垒机用户名</label>
-                  <input v-model="form.server.bastionUser" placeholder="root" />
-                </div>
-                <div class="form-group">
-                  <label>堡垒机认证方式</label>
-                  <select v-model="form.server.bastionAuthType">
-                    <option value="password">密码</option>
-                    <option value="ssh_key">SSH 密钥</option>
-                  </select>
-                </div>
-                <div class="form-group" v-if="form.server.bastionAuthType === 'password'">
-                  <label>堡垒机密码</label>
-                  <input v-model="form.server.bastionPassword" type="password" placeholder="可留空，执行时弹窗输入" />
-                </div>
-                <div class="form-group" v-if="form.server.bastionAuthType === 'ssh_key'">
-                  <label>堡垒机 SSH 私钥</label>
-                  <textarea v-model="form.server.bastionSshKey" rows="3" placeholder="粘贴 SSH 私钥内容"></textarea>
-                </div>
-              </template>
             </section>
 
             <!-- 右侧：网络访问链路 -->
@@ -898,14 +876,6 @@ const form = reactive({
     sshKey: '',
     deployPath: '/opt/apps',
     backupBeforeDeploy: true,
-    // 堡垒机配置
-    useBastion: false,
-    bastionHost: '',
-    bastionPort: 22,
-    bastionUser: '',
-    bastionAuthType: 'password',
-    bastionPassword: '',
-    bastionSshKey: '',
   },
   // 网络访问链路
   networkAccess: {
@@ -921,7 +891,35 @@ const form = reactive({
   },
   // 国内镜像选项
   useChinaMirror: false,  // 使用国内镜像源（适用于国产 OS 或国内网络）
+  // 依赖仓库配置
+  dependencyRepo: {
+    url: '',
+    branch: 'main',
+    authType: 'password',
+    username: '',
+    password: '',
+    sshKey: '',
+  },
 })
+
+// 自动从 repoUrl 提取 projectName
+watch(() => form.repoUrl, (url) => {
+  if (url && url.trim()) {
+    // 支持格式：
+    // https://github.com/owner/project.git
+    // git@github.com:owner/project.git
+    // https://gitlab.com/group/subgroup/project.git
+    const match = url.trim().match(/\/([^\/]+?)(?:\.git)?\/?$/) ||
+                  url.trim().match(/:([^:\/]+?)(?:\.git)?\/?$/)
+    if (match && match[1]) {
+      form.projectName = match[1]
+    } else {
+      form.projectName = ''
+    }
+  } else {
+    form.projectName = ''
+  }
+}, { immediate: true })
 
 // 页面状态
 const page = ref('form') // 'form' | 'result' | 'progress'
@@ -1059,8 +1057,6 @@ const canExecute = computed(() => {
     if (!form.branch || form.branch.trim() === '') return false
     // 专用服务器模式：工具服务器地址必填
     if (form.toolDeploy === 'dedicated' && !form.toolServer.host) return false
-    // 启用堡垒机：堡垒机地址和用户名必填
-    if (form.server.useBastion && (!form.server.bastionHost || !form.server.bastionUser)) return false
   }
   
   return true
@@ -1204,11 +1200,6 @@ async function onAutoDeploy() {
     error.value = '已选择专用服务器部署，请填写 CI/CD 工具服务器地址'
     return
   }
-  // 启用堡垒机：必须填写堡垒机地址和用户
-  if (form.server.useBastion && (!form.server.bastionHost || !form.server.bastionUser)) {
-    error.value = '已启用堡垒机跳转，请填写堡垒机地址和用户名'
-    return
-  }
 
   error.value = null
   deploying.value = true
@@ -1240,6 +1231,7 @@ async function onAutoDeploy() {
       networkAccess: showAccessConfig.value && form.networkAccess.hops.length > 0 ? form.networkAccess : null,
       appServer: form.deployMethod === 'app_server' ? form.appServer : null,
       useChinaMirror: form.useChinaMirror,  // 国内镜像选项
+      dependencyRepo: form.dependencyRepo.url ? form.dependencyRepo : null,  // 独立依赖仓库
     }
 
     const { taskId } = await startAutoDeploy(payload)
