@@ -54,6 +54,36 @@ class DependencyRepoConfig(BaseModel):
     sshKey: str = ""
 
 
+class EnvironmentConfig(BaseModel):
+    """多环境配置（开发/测试/预发等）
+
+    每个环境对应一个集成分支和独立的部署服务器。
+    集成测试模式下，功能分支临时合入环境分支进行集成验证，不合入主干。
+    """
+    name: str = ""              # 环境名称：dev/test/staging 等
+    branch: str = ""            # 环境集成分支
+    server: Optional["ServerConfig"] = None  # 该环境的部署服务器
+
+
+class LoadBalancerConfig(BaseModel):
+    """负载均衡配置
+
+    应用部署在多台后端服务器，由负载均衡器统一接入。
+    流水线采用滚动部署：逐台部署 + 健康检查，保证服务不中断。
+    """
+    type: str = "nginx"             # nginx（自建）| cloud_slb（云 SLB，预留）
+    host: str = ""                  # 负载均衡服务器地址
+    port: int = 22                  # LB 服务器 SSH 端口
+    username: str = "root"
+    authType: str = "password"
+    password: str = ""
+    sshKey: str = ""
+    listenPort: int = 80            # LB 对外监听端口
+    healthCheckPath: str = "/"      # 健康检查路径
+    healthCheckRetries: int = 6     # 健康检查重试次数（每次间隔 5 秒）
+    servers: List["ServerConfig"] = []  # 后端服务器列表
+
+
 class PipelineConfig(BaseModel):
     tool: str
     projectType: str
@@ -69,6 +99,9 @@ class PipelineConfig(BaseModel):
     releaseStrategy: Optional[dict] = None  # 发布策略
     useChinaMirror: bool = False  # 是否使用国内镜像（用于国产 OS 或国内网络环境）
     dependencyRepo: Optional[DependencyRepoConfig] = None  # 独立依赖仓库
+    pipelineMode: str = "release"  # release（部署后合并主分支）| integration（临时集成测试）
+    environments: Optional[List[EnvironmentConfig]] = None  # 多环境配置
+    loadBalancer: Optional[LoadBalancerConfig] = None  # 负载均衡配置
 
 
 class ReleaseStrategy(BaseModel):
@@ -95,6 +128,11 @@ class ServerConfig(BaseModel):
     sshKey: str = ""
     deployPath: str = "/opt/apps"
     backupBeforeDeploy: bool = True  # 部署前备份旧版本
+
+
+# 解析 EnvironmentConfig/LoadBalancerConfig 中对 ServerConfig 的前向引用
+EnvironmentConfig.model_rebuild()
+LoadBalancerConfig.model_rebuild()
 
 
 class RelayServerConfig(BaseModel):
@@ -148,6 +186,17 @@ class NetworkAccessConfig(BaseModel):
     targetHost: str = ""
 
 
+class CloudServiceCredential(BaseModel):
+    """云托管服务凭据（云效/CodeArts 等）"""
+    provider: str = "aliyun"    # aliyun | huawei | tencent | github | gitlab
+    accessKeyId: str = ""       # AccessKey ID（aliyun/huawei/tencent）
+    accessKeySecret: str = ""   # AccessKey Secret（aliyun/huawei/tencent）
+    regionId: str = "cn_hangzhou"  # 区域 ID
+    organizationId: str = ""    # 组织 ID（可选）
+    token: str = ""             # Personal Access Token（github/gitlab）
+    baseUrl: str = ""           # 自建实例地址（gitlab: https://gitlab.example.com）
+
+
 class AutoDeployConfig(BaseModel):
     tool: str
     projectType: str
@@ -169,6 +218,10 @@ class AutoDeployConfig(BaseModel):
     releaseStrategy: Optional[dict] = None  # 发布策略
     useChinaMirror: bool = False  # 是否使用国内镜像（用于国产 OS 或国内网络环境）
     dependencyRepo: Optional[DependencyRepoConfig] = None  # 独立依赖仓库
+    cloudCredential: Optional[CloudServiceCredential] = None  # 云托管服务凭据
+    pipelineMode: str = "release"  # release（部署后合并主分支）| integration（临时集成测试）
+    environments: Optional[List[EnvironmentConfig]] = None  # 多环境配置
+    loadBalancer: Optional[LoadBalancerConfig] = None  # 负载均衡配置
 
 
 @app.get("/api/tools")

@@ -40,7 +40,23 @@ def generate_jenkins(config, output_dir):
         release_readme = build_release_readme(config)
         files.append({"name": "README-Release.md", "content": release_readme})
 
+    # 负载均衡文件：滚动部署脚本 + Nginx upstream 配置
+    from generators.lb import has_load_balancer, build_rolling_deploy_script, build_nginx_upstream_conf
+    if has_load_balancer(config):
+        files.append({"name": "deploy/rolling-deploy.sh", "content": build_rolling_deploy_script(config, _ssh_options(config))})
+        files.append({"name": "deploy/nginx-lb.conf", "content": build_nginx_upstream_conf(config)})
+
     return files
+
+def _ssh_options(c):
+    """生成 SSH 选项（与 Jenkinsfile 中 SSH_OPTIONS 保持一致，支持堡垒机穿透）"""
+    ssh_options = "-o StrictHostKeyChecking=no"
+    bastion_host = getattr(c, 'bastionHost', '')
+    bastion_user = getattr(c, 'bastionUser', '')
+    bastion_port = getattr(c, 'bastionPort', 22)
+    if bastion_host and bastion_user:
+        ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
+    return ssh_options
 
 def _get_branches(c):
     """获取分支列表，兼容单分支和多分支"""
@@ -62,6 +78,13 @@ def _build_jenkinsfile(c):
     if has_dep_repo(c):
         stages.append(_build_checkout_deps_stage(c))
 
+    # 集成测试模式：功能分支临时合入环境集成分支（第一个环境为集成目标）
+    from generators.lb import is_integration_mode, get_environments
+    if is_integration_mode(c):
+        envs = get_environments(c)
+        if envs:
+            stages.append(_build_integration_stage(c, envs[0]))
+
     # Auto-determine build stages based on project type
     if c.projectType.startswith("java"):
         stages.append(_build_build_stage(c))  # Maven/Gradle build
@@ -74,7 +97,7 @@ def _build_jenkinsfile(c):
     else:
         stages.append(_build_code_stage(c))  # Just deploy code
     stages.append(_build_test_stage(c))
-    stages.append(_build_deploy_stage(c))
+    stages.extend(_build_deploy_stages(c))
 
     stage_blocks = "\n".join(stages)
 
@@ -89,9 +112,7 @@ def _build_jenkinsfile(c):
     bastion_user = getattr(c, 'bastionUser', '')
     
     # 生成 SSH 选项（用于穿透堡垒机）
-    ssh_options = "-o StrictHostKeyChecking=no"
-    if bastion_host and bastion_user:
-        ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
+    ssh_options = _ssh_options(c)
 
     # 依赖仓库环境变量
     dep_repo_env = ""
@@ -381,6 +402,11 @@ def _build_test_stage(c):
 
 def _build_deploy_stage(c):
     """生成部署阶段（包含备份、部署、启动）"""
+    # 负载均衡模式：滚动部署到多台后端服务器
+    from generators.lb import has_load_balancer
+    if has_load_balancer(c):
+        return _build_lb_deploy_stage(c)
+
     # Docker 部署模式：目标服务器上构建并运行容器
     if getattr(c, 'deployMethod', 'direct') == 'docker':
         return _build_docker_deploy_stage(c)
@@ -552,6 +578,116 @@ def _build_docker_deploy_stage(c):
                 }}
             }}
         }}"""
+
+def _build_lb_deploy_stage(c):
+    """生成负载均衡滚动部署阶段
+
+    打包部署内容后执行 deploy/rolling-deploy.sh：
+    逐台部署后端服务器 + 健康检查，任一节点失败即中止，保证服务不中断。
+    """
+    if getattr(c, 'deployMethod', 'direct') == 'docker':
+        pack_cmd = f"""                        // Docker 模式：打包源码（多阶段构建在后端服务器容器内完成）
+                        tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
+                            --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
+                            -czf /tmp/${{PROJECT_NAME}}.tar.gz ."""
+    else:
+        pack_cmds = {
+            "java-maven": f"mkdir -p /tmp/lb-artifact && cp target/{c.projectName}.jar /tmp/lb-artifact/ && tar -czf {c.projectName}-artifact.tar.gz -C /tmp/lb-artifact .",
+            "java-gradle": f"mkdir -p /tmp/lb-artifact && cp build/libs/{c.projectName}-*.jar /tmp/lb-artifact/{c.projectName}.jar && tar -czf {c.projectName}-artifact.tar.gz -C /tmp/lb-artifact .",
+            "vue": "tar -czf {p}-artifact.tar.gz dist".format(p=c.projectName),
+            "react": "tar -czf {p}-artifact.tar.gz dist".format(p=c.projectName),
+            "python": "tar --exclude='.git' --exclude='__pycache__' -czf {p}-artifact.tar.gz .".format(p=c.projectName),
+            "go": "mkdir -p /tmp/lb-artifact && cp ./app /tmp/lb-artifact/ && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .".format(p=c.projectName),
+        }
+        pack_cmd = "                        " + pack_cmds.get(c.projectType, pack_cmds["python"])
+
+    return f"""        stage('Deploy (负载均衡滚动部署)') {{
+            steps {{
+                script {{
+                    echo '开始负载均衡滚动部署（逐台部署 + 健康检查）...'
+                    sh '''
+{pack_cmd}
+                        bash deploy/rolling-deploy.sh
+                        rm -f /tmp/${{PROJECT_NAME}}.tar.gz {c.projectName}-artifact.tar.gz 2>/dev/null || true
+                    '''
+                }}
+            }}
+        }}"""
+
+def _build_env_deploy_stage(c, env):
+    """生成针对指定环境的部署阶段
+
+    通过 stage 级 environment 覆盖 SERVER_HOST/SERVER_USER，
+    复用标准部署阶段逻辑，部署到该环境自己的服务器。
+    """
+    name = env.get('name', 'env')
+    server = env.get('server') or {}
+    if not server.get('host'):
+        return ""
+
+    base = _build_deploy_stage(c)
+    if not base:
+        return ""
+
+    env_block = f"""
+            environment {{
+                SERVER_HOST = '{server.get('host')}'
+                SERVER_USER = '{server.get('username', 'root')}'
+            }}"""
+    # 重命名阶段并注入 stage 级环境变量覆盖
+    base = base.replace("stage('Deploy')", f"stage('Deploy-{name}')", 1)
+    base = base.replace("stage('Deploy (负载均衡滚动部署)')", f"stage('Deploy-{name} (负载均衡滚动部署)')", 1)
+    base = base.replace("\n            steps {", f"{env_block}\n            steps {{", 1)
+    return base
+
+def _build_integration_stage(c, env):
+    """生成集成测试合并阶段（integration 模式）
+
+    将触发流水线的功能分支临时合入环境集成分支（仅 CI 工作区，不推送远端），
+    后续构建/部署基于合并后的代码，实现多分支临时集成测试。
+    """
+    env_branch = env.get('branch') or env.get('name', 'test')
+    return f"""        stage('集成到 {env.get('name', 'test')} 环境') {{
+            when {{
+                not {{ branch '{env_branch}' }}
+            }}
+            steps {{
+                script {{
+                    echo '临时集成分支（仅 CI 工作区，不推送远端）...'
+                    sh '''
+                        git config user.name "auto-cicd" && git config user.email "auto-cicd@local"
+                        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+                        git fetch origin {env_branch} || true
+                        git checkout -B {env_branch} origin/{env_branch} 2>/dev/null || git checkout -b {env_branch}
+                        git merge $CURRENT_BRANCH --no-edit || {{ echo "❌ 合并冲突，集成测试中止"; exit 1; }}
+                        echo "✅ 已临时集成 $CURRENT_BRANCH 到 {env_branch}"
+                    '''
+                }}
+            }}
+        }}"""
+
+def _build_deploy_stages(c):
+    """按配置生成部署阶段列表
+
+    - 负载均衡：单个滚动部署阶段（_build_deploy_stage 内部已路由）
+    - 多环境：每个环境一个 Deploy-<env> 阶段
+    - 默认：单个 Deploy 阶段
+    """
+    from generators.lb import get_environments, has_load_balancer
+
+    if has_load_balancer(c):
+        return [_build_deploy_stage(c)]
+
+    envs = get_environments(c)
+    if envs:
+        stages = []
+        for env in envs:
+            stage = _build_env_deploy_stage(c, env)
+            if stage:
+                stages.append(stage)
+        if stages:
+            return stages
+    return [_build_deploy_stage(c)]
 
 def _build_dockerfile(c):
     if c.projectType == "java-maven":

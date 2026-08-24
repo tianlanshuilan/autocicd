@@ -366,6 +366,96 @@
                   <textarea v-model="form.dependencyRepo.sshKey" rows="3" placeholder="粘贴 SSH 私钥内容"></textarea>
                 </div>
               </div>
+
+              <!-- 流水线模式 -->
+              <div class="form-group">
+                <label class="section-label">
+                  <span>🔀 流水线模式</span>
+                  <span class="section-hint">发布模式部署验证后合并主分支；集成测试模式将功能分支临时合入环境分支测试，不合主干</span>
+                </label>
+                <select v-model="form.pipelineMode">
+                  <option value="release">发布模式（部署后合并到主分支）</option>
+                  <option value="integration">集成测试模式（多分支临时集成，不合入主干）</option>
+                </select>
+              </div>
+
+              <!-- 多环境配置 -->
+              <div class="form-group">
+                <label class="section-label">
+                  <span>🌍 多环境部署（可选）</span>
+                  <span class="section-hint">每个环境对应一个集成分支与独立服务器{{ form.pipelineMode === 'integration' ? '，第一个环境为集成目标' : '' }}</span>
+                </label>
+                <div class="env-item" v-for="(env, i) in form.environments" :key="i">
+                  <div class="env-item-head">
+                    <input v-model="env.name" placeholder="环境名，如 dev / test / staging" class="env-name" />
+                    <input v-model="env.branch" placeholder="集成分支，如 env/dev" class="env-branch" />
+                    <button class="btn-remove-env" @click="removeEnvironment(i)" title="删除环境">&times;</button>
+                  </div>
+                  <div class="env-item-server">
+                    <input v-model="env.server.host" placeholder="环境服务器地址" />
+                    <input v-model="env.server.username" placeholder="root" class="env-small" />
+                    <input v-model="env.server.password" type="password" placeholder="密码（可留空）" class="env-small" />
+                  </div>
+                </div>
+                <button class="btn-add-hop" @click="addEnvironment">+ 添加环境</button>
+              </div>
+
+              <!-- 负载均衡 -->
+              <div class="form-group">
+                <label class="section-label">
+                  <span>⚖️ 负载均衡（可选）</span>
+                  <span class="section-hint">多后端服务器 + Nginx 负载均衡，流水线滚动部署（逐台部署 + 健康检查，服务不中断）</span>
+                </label>
+                <label class="checkbox-label">
+                  <input type="checkbox" v-model="form.loadBalancer.enabled" />
+                  <span class="checkmark"></span>
+                  <span class="check-text">
+                    <span class="check-title">启用负载均衡部署</span>
+                  </span>
+                </label>
+                <div v-if="form.loadBalancer.enabled" class="lb-config">
+                  <div class="form-row">
+                    <div class="form-group">
+                      <label>LB 服务器地址</label>
+                      <input v-model="form.loadBalancer.host" placeholder="192.168.1.1" />
+                    </div>
+                    <div class="form-group">
+                      <label>对外监听端口</label>
+                      <input v-model.number="form.loadBalancer.listenPort" type="number" placeholder="80" />
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <div class="form-group">
+                      <label>用户名</label>
+                      <input v-model="form.loadBalancer.username" placeholder="root" />
+                    </div>
+                    <div class="form-group">
+                      <label>密码</label>
+                      <input v-model="form.loadBalancer.password" type="password" placeholder="可留空，执行时弹窗输入" />
+                    </div>
+                  </div>
+                  <div class="form-row">
+                    <div class="form-group">
+                      <label>健康检查路径</label>
+                      <input v-model="form.loadBalancer.healthCheckPath" placeholder="/" />
+                    </div>
+                    <div class="form-group">
+                      <label>健康检查重试次数</label>
+                      <input v-model.number="form.loadBalancer.healthCheckRetries" type="number" placeholder="6" />
+                    </div>
+                  </div>
+                  <label class="section-label"><span>后端服务器</span></label>
+                  <div class="env-item" v-for="(s, i) in form.loadBalancer.servers" :key="i">
+                    <div class="env-item-server">
+                      <input v-model="s.host" placeholder="后端服务器地址" />
+                      <input v-model="s.username" placeholder="root" class="env-small" />
+                      <input v-model="s.deployPath" placeholder="/opt/apps" class="env-small" />
+                      <button class="btn-remove-env" @click="form.loadBalancer.servers.splice(i, 1)" title="删除服务器">&times;</button>
+                    </div>
+                  </div>
+                  <button class="btn-add-hop" @click="addLbServer">+ 添加后端服务器</button>
+                </div>
+              </div>
             </section>
 
             <!-- 右侧：网络访问链路 -->
@@ -470,6 +560,82 @@
               <div class="access-desc" style="margin-top: 12px; margin-bottom: 0;">🔗 配置从 CI/CD 端到目标服务器的网络链路。<br/>常见场景：阿里云效 → 零信任网关 → 堡垒机 → 目标服务器</div>
             </section>
           </div>
+
+          <!-- 云服务凭据配置（仅云托管工具显示） -->
+          <section class="section" v-if="isCloudService">
+            <h3>8. 云服务凭据</h3>
+
+            <!-- AccessKey 模式：云效/CodeArts/CODING（用于 API 创建流水线） -->
+            <template v-if="cloudAuthMode === 'accesskey'">
+              <div class="form-group">
+                <label>云服务商</label>
+                <select v-model="form.cloudCredential.provider">
+                  <option value="aliyun">阿里云（云效 DevOps）</option>
+                  <option value="huawei">华为云（CodeArts）</option>
+                  <option value="tencent">腾讯云（CODING）</option>
+                </select>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>AccessKey ID <span class="required">*</span></label>
+                  <input v-model="form.cloudCredential.accessKeyId" placeholder="阿里云 AccessKey ID" />
+                </div>
+                <div class="form-group">
+                  <label>AccessKey Secret <span class="required">*</span></label>
+                  <input v-model="form.cloudCredential.accessKeySecret" type="password" placeholder="阿里云 AccessKey Secret" />
+                </div>
+              </div>
+              <div class="form-row">
+                <div class="form-group">
+                  <label>区域</label>
+                  <select v-model="form.cloudCredential.regionId">
+                    <option v-for="r in currentRegions" :key="r.value" :value="r.value">{{ r.label }}</option>
+                  </select>
+                </div>
+                <div class="form-group">
+                  <label>组织 ID（可选）</label>
+                  <input v-model="form.cloudCredential.organizationId" placeholder="云效组织 ID" />
+                </div>
+              </div>
+              <div class="access-desc" style="margin-top: 8px;">
+                <template v-if="form.cloudCredential.provider === 'aliyun'">
+                  🔑 获取方式：登录阿里云控制台 → 右上角头像 → AccessKey 管理 → 创建 AccessKey<br/>
+                  权限建议：使用 RAM 子账号，授予 AliyunDevOpsFullAccess 权限
+                </template>
+                <template v-else-if="form.cloudCredential.provider === 'huawei'">
+                  🔑 获取方式：登录华为云控制台 → 右上角用户名 → 我的凭证 → 访问密钥 → 新增访问密钥<br/>
+                  权限建议：使用 IAM 子用户，授予 CodeArts 相关权限
+                </template>
+                <template v-else>
+                  🔑 获取方式：登录腾讯云控制台 → 右上角账号 → 访问管理 → API 密钥管理 → 新建密钥<br/>
+                  权限建议：使用 CAM 子用户，授予 CODING 相关权限
+                </template>
+              </div>
+            </template>
+
+            <!-- Token 模式：GitHub Actions / GitLab CI（用于自动写入 Secrets/Variables） -->
+            <template v-else>
+              <div class="form-group">
+                <label>Personal Access Token（可选，填写后自动配置 Secrets）</label>
+                <input v-model="form.cloudCredential.token" type="password"
+                       :placeholder="form.tool === 'github' ? 'ghp_xxx（repo 权限）' : 'glpat-xxx（api 权限）'" />
+              </div>
+              <div class="form-group" v-if="form.tool === 'gitlab'">
+                <label>GitLab 实例地址（自建 GitLab 填写）</label>
+                <input v-model="form.cloudCredential.baseUrl" placeholder="https://gitlab.com（默认）" />
+              </div>
+              <div class="access-desc" style="margin-top: 8px;">
+                <template v-if="form.tool === 'github'">
+                  🔑 获取方式：GitHub → Settings → Developer settings → Personal access tokens → Generate new token（勾选 repo 权限）<br/>
+                  用途：自动写入 SERVER_SSH_KEY / DEP_REPO_TOKEN 等 Secrets；不填则需搭建后手动配置
+                </template>
+                <template v-else>
+                  🔑 获取方式：GitLab → User Settings → Access Tokens → 创建 Token（勾选 api 权限）<br/>
+                  用途：自动写入 CI/CD Variables（SERVER_SSH_KEY / DEP_REPO_TOKEN）；不填则需搭建后手动配置
+                </template>
+              </div>
+            </template>
+          </section>
 
           <!-- Step 8: CI/CD 工具部署位置 -->
           <section class="section">
@@ -900,6 +1066,35 @@ const form = reactive({
     password: '',
     sshKey: '',
   },
+  // 云托管服务凭据（云效/CodeArts/GitHub/GitLab）
+  cloudCredential: {
+    provider: 'aliyun',
+    accessKeyId: '',
+    accessKeySecret: '',
+    regionId: 'cn_hangzhou',
+    organizationId: '',
+    token: '',       // GitHub PAT / GitLab Token
+    baseUrl: '',     // 自建实例地址（GitLab/GitHub Enterprise）
+  },
+  // 流水线模式：release（发布）| integration（集成测试）
+  pipelineMode: 'release',
+  // 多环境配置（每个环境 = 集成分支 + 独立服务器）
+  environments: [],
+  // 负载均衡配置（多后端服务器 + Nginx，滚动部署）
+  loadBalancer: {
+    enabled: false,
+    type: 'nginx',
+    host: '',
+    port: 22,
+    username: 'root',
+    authType: 'password',
+    password: '',
+    sshKey: '',
+    listenPort: 80,
+    healthCheckPath: '/',
+    healthCheckRetries: 6,
+    servers: [],
+  },
 })
 
 // 自动从 repoUrl 提取 projectName
@@ -950,6 +1145,16 @@ const currentToolIsCloudOnly = computed(() => {
 // 是否为 Java 项目
 const isJavaProject = computed(() => {
   return form.projectType === 'java-maven' || form.projectType === 'java-gradle'
+})
+
+// 是否为云托管服务（需要云服务凭据）
+const isCloudService = computed(() => {
+  return ['aliyun', 'huawei', 'tencent', 'github', 'gitlab'].includes(form.tool)
+})
+
+// 云服务凭据认证模式：github/gitlab 用 Token，其余用 AccessKey
+const cloudAuthMode = computed(() => {
+  return (form.tool === 'github' || form.tool === 'gitlab') ? 'token' : 'accesskey'
 })
 
 // 流水线管理信息
@@ -1044,6 +1249,49 @@ watch(() => form.tool, (newTool) => {
       }
     }
   }
+  // 云服务凭据提供商随流水线工具自动联动
+  if (['aliyun', 'huawei', 'tencent', 'github', 'gitlab'].includes(newTool)) {
+    form.cloudCredential.provider = newTool
+  }
+})
+
+// 云服务区域选项（按云服务商区分）
+const cloudRegions = {
+  aliyun: [
+    { value: 'cn_hangzhou', label: '华东 1（杭州）' },
+    { value: 'cn_shanghai', label: '华东 2（上海）' },
+    { value: 'cn_beijing', label: '华北 2（北京）' },
+    { value: 'cn_shenzhen', label: '华南 1（深圳）' },
+    { value: 'cn_qingdao', label: '华北 1（青岛）' },
+    { value: 'cn_zhangjiakou', label: '华北 3（张家口）' },
+    { value: 'cn_chengdu', label: '西南 1（成都）' },
+  ],
+  huawei: [
+    { value: 'cn-north-4', label: '华北四（北京）' },
+    { value: 'cn-north-1', label: '华北一（北京）' },
+    { value: 'cn-east-3', label: '上海二' },
+    { value: 'cn-east-2', label: '上海一' },
+    { value: 'cn-south-1', label: '华南一（广州）' },
+    { value: 'cn-southwest-2', label: '西南一（贵阳）' },
+  ],
+  tencent: [
+    { value: 'ap-guangzhou', label: '广州' },
+    { value: 'ap-beijing', label: '北京' },
+    { value: 'ap-shanghai', label: '上海' },
+    { value: 'ap-shenzhen', label: '深圳' },
+    { value: 'ap-chengdu', label: '成都' },
+    { value: 'ap-chongqing', label: '重庆' },
+  ],
+}
+const currentRegions = computed(() => cloudRegions[form.cloudCredential.provider] || cloudRegions.aliyun)
+
+// 切换云服务商时，区域重置为该服务商的默认区域
+watch(() => form.cloudCredential.provider, (p) => {
+  const defaults = { aliyun: 'cn_hangzhou', huawei: 'cn-north-4', tencent: 'ap-guangzhou' }
+  const def = defaults[p]
+  if (def && !(cloudRegions[p] || []).some(r => r.value === form.cloudCredential.regionId)) {
+    form.cloudCredential.regionId = def
+  }
 })
 
 // 执行按钮条件检查
@@ -1057,6 +1305,9 @@ const canExecute = computed(() => {
     if (!form.branch || form.branch.trim() === '') return false
     // 专用服务器模式：工具服务器地址必填
     if (form.toolDeploy === 'dedicated' && !form.toolServer.host) return false
+    // 云托管工具：AccessKey 模式必填（github/gitlab 用可选 Token，不强制）
+    if (isCloudService.value && cloudAuthMode.value === 'accesskey'
+        && (!form.cloudCredential.accessKeyId || !form.cloudCredential.accessKeySecret)) return false
   }
   
   return true
@@ -1117,6 +1368,55 @@ function addHop(type) {
   })
   // 自动切换到新添加的选项卡
   activeHopIndex.value = form.networkAccess.hops.length - 1
+}
+
+function addEnvironment() {
+  form.environments.push({
+    name: '',
+    branch: '',
+    server: {
+      host: '',
+      port: 22,
+      username: 'root',
+      authType: 'password',
+      password: '',
+      sshKey: '',
+      deployPath: form.server.deployPath || '/opt/apps',
+      backupBeforeDeploy: true,
+    },
+  })
+}
+
+function removeEnvironment(index) {
+  form.environments.splice(index, 1)
+}
+
+function addLbServer() {
+  form.loadBalancer.servers.push({
+    host: '',
+    port: 22,
+    username: 'root',
+    authType: 'password',
+    password: '',
+    sshKey: '',
+    deployPath: form.server.deployPath || '/opt/apps',
+    backupBeforeDeploy: true,
+  })
+}
+
+// 有效的环境配置（名称 + 服务器地址均填写）
+function validEnvironments() {
+  return form.environments.filter(e => e.name && e.server && e.server.host)
+}
+
+// 有效的负载均衡配置（启用 + LB 地址 + 至少一台后端）
+function validLoadBalancer() {
+  const lb = form.loadBalancer
+  if (!lb.enabled || !lb.host) return null
+  const servers = lb.servers.filter(s => s.host)
+  if (servers.length === 0) return null
+  const { enabled, ...rest } = lb
+  return { ...rest, servers }
 }
 function removeHop(index) {
   form.networkAccess.hops.splice(index, 1)
@@ -1200,6 +1500,16 @@ async function onAutoDeploy() {
     error.value = '已选择专用服务器部署，请填写 CI/CD 工具服务器地址'
     return
   }
+  // 集成测试模式：至少需要一个有效环境
+  if (form.pipelineMode === 'integration' && validEnvironments().length === 0) {
+    error.value = '集成测试模式需要至少配置一个环境（环境名 + 集成分支 + 服务器地址）'
+    return
+  }
+  // 负载均衡：启用后必须填写 LB 地址与至少一台后端服务器
+  if (form.loadBalancer.enabled && !validLoadBalancer()) {
+    error.value = '已启用负载均衡，请填写 LB 服务器地址并添加至少一台后端服务器'
+    return
+  }
 
   error.value = null
   deploying.value = true
@@ -1232,6 +1542,10 @@ async function onAutoDeploy() {
       appServer: form.deployMethod === 'app_server' ? form.appServer : null,
       useChinaMirror: form.useChinaMirror,  // 国内镜像选项
       dependencyRepo: form.dependencyRepo.url ? form.dependencyRepo : null,  // 独立依赖仓库
+      cloudCredential: isCloudService.value ? form.cloudCredential : null,  // 云托管服务凭据
+      pipelineMode: form.pipelineMode,  // 流水线模式：release | integration
+      environments: validEnvironments().length > 0 ? validEnvironments() : null,  // 多环境配置
+      loadBalancer: validLoadBalancer(),  // 负载均衡配置
     }
 
     const { taskId } = await startAutoDeploy(payload)
@@ -1726,6 +2040,7 @@ async function fetchRecommendations() {
 
 .form-group { margin-bottom: 12px; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.required { color: #e53935; font-weight: 400; }
 label { display: block; font-size: 12px; color: #555; margin-bottom: 4px; font-weight: 500; }
 input, select, textarea {
   width: 100%;
@@ -2275,6 +2590,60 @@ textarea { resize: vertical; }
   border-color: #4a90d9;
   color: #4a90d9;
   background: #f0f6ff;
+}
+
+/* 多环境 / 负载均衡 */
+.env-item {
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 8px;
+  background: #fafbfc;
+}
+.env-item-head {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.env-item-head .env-name {
+  flex: 2;
+}
+.env-item-head .env-branch {
+  flex: 3;
+}
+.env-item-server {
+  display: flex;
+  gap: 8px;
+}
+.env-item-server input {
+  flex: 3;
+}
+.env-item-server .env-small {
+  flex: 2;
+}
+.btn-remove-env {
+  flex: 0 0 auto;
+  width: 28px;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  background: #fff;
+  color: #999;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.btn-remove-env:hover {
+  border-color: #e53935;
+  color: #e53935;
+  background: #fff5f5;
+}
+.lb-config {
+  margin-top: 10px;
+  padding: 12px;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  background: #fafbfc;
 }
 
 /* 部署建议 */

@@ -22,6 +22,12 @@ def generate_github(config, output_dir):
         release_readme = build_release_readme(config)
         files.append({"name": "README-Release.md", "content": release_readme})
 
+    # 负载均衡文件：滚动部署脚本 + Nginx upstream 配置
+    from generators.lb import has_load_balancer, build_rolling_deploy_script, build_nginx_upstream_conf
+    if has_load_balancer(config):
+        files.append({"name": "deploy/rolling-deploy.sh", "content": build_rolling_deploy_script(config)})
+        files.append({"name": "deploy/nginx-lb.conf", "content": build_nginx_upstream_conf(config)})
+
     return files
 
 def _get_build_cmd(c):
@@ -89,6 +95,9 @@ def _build_workflow(c):
     artifact = _get_artifact_path(c)
     branches = _get_branches(c)
 
+    from generators.lb import is_integration_mode
+    integration = is_integration_mode(c)
+
     jdk = c.jdkVersion or "17"
     node = c.nodeVersion or "20"
 
@@ -122,23 +131,29 @@ def _build_workflow(c):
           python-version: '3.11'
 """
 
-    branch_list = ", ".join(branches)
+    # 集成测试模式：任意功能分支触发，检出触发分支本身（不固定 ref）
+    if integration:
+        branch_list = "'**'"
+        matrix_section = ""
+        checkout_ref = ""
+    else:
+        branch_list = ", ".join(branches)
 
-    # 多分支时使用矩阵策略并行构建
-    matrix_section = ""
-    checkout_ref = ""
-    if len(branches) > 1:
-        matrix_branches = "\n".join(f"          - {b}" for b in branches)
-        matrix_section = f"""    strategy:
+        # 多分支时使用矩阵策略并行构建
+        matrix_section = ""
+        checkout_ref = ""
+        if len(branches) > 1:
+            matrix_branches = "\n".join(f"          - {b}" for b in branches)
+            matrix_section = f"""    strategy:
       matrix:
         branch:
 {matrix_branches}
       fail-fast: false
 """
-        checkout_ref = f"""        ref: ${{{{ matrix.branch }}}}
+            checkout_ref = f"""        ref: ${{{{ matrix.branch }}}}
 """
-    else:
-        checkout_ref = f"""        ref: {branches[0]}
+        else:
+            checkout_ref = f"""        ref: {branches[0]}
 """
 
     # 依赖仓库检出步骤
@@ -153,6 +168,16 @@ def _build_workflow(c):
           path: .dep-repo
           token: ${{{{ secrets.DEP_REPO_TOKEN }}}}
 """
+
+    # checkout 块（无 with 参数时省略 with 段）
+    checkout_block = "      - uses: actions/checkout@v4"
+    if checkout_ref or checkout_deps_step:
+        checkout_block += f"""
+        with:
+{checkout_ref}{checkout_deps_step}"""
+
+    # 集成测试模式：检出后先将功能分支临时合入环境集成分支
+    integration_step = _build_integration_step(c) if integration else ""
 
     return f"""# GitHub Actions CI
 # 项目: {c.projectName}
@@ -174,9 +199,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
 {matrix_section}    steps:
-      - uses: actions/checkout@v4
-        with:
-{checkout_ref}{checkout_deps_step}{setup_java}{setup_node}{setup_go}{setup_python}      - name: Build
+{checkout_block}
+{integration_step}{setup_java}{setup_node}{setup_go}{setup_python}      - name: Build
         run: {build}
       - name: Test
         run: {test}
@@ -188,9 +212,31 @@ jobs:
             {artifact}
 """
 
+def _build_integration_step(c):
+    """集成测试模式：将触发的功能分支临时合入环境集成分支（仅 CI 工作区，不推送远端）"""
+    from generators.lb import get_environments
+    envs = get_environments(c)
+    if not envs:
+        return ""
+    env = envs[0]
+    env_branch = env.get('branch') or env.get('name', 'test')
+    name = env.get('name', 'test')
+    return f"""      - name: 集成到 {name} 环境
+        if: github.ref_name != '{env_branch}'
+        run: |
+          git config user.name "auto-cicd" && git config user.email "auto-cicd@local"
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git fetch origin {env_branch} || true
+          git checkout -B {env_branch} origin/{env_branch} 2>/dev/null || git checkout -b {env_branch}
+          git merge $CURRENT_BRANCH --no-edit || {{ echo "❌ 合并冲突，集成测试中止"; exit 1; }}
+          echo "✅ 已临时集成 $CURRENT_BRANCH 到 {env_branch}"
+"""
+
 def _build_deploy_workflow(c):
     branches = _get_branches(c)
-    branch_list = ", ".join(branches)
+    from generators.lb import is_integration_mode, has_load_balancer, get_environments
+    integration = is_integration_mode(c)
+    branch_list = "'**'" if integration else ", ".join(branches)
 
     # 服务器和堡垒机配置
     server_host = getattr(c, 'serverHost', '')
@@ -205,46 +251,37 @@ def _build_deploy_workflow(c):
     if bastion_host and bastion_user:
         ssh_options += f" -J {bastion_user}@{bastion_host}:{bastion_port}"
 
-    # Docker 部署模式：传输源码到目标服务器，docker-compose 构建运行
-    # （多阶段 Dockerfile 使构建在容器内完成，无需传输构建产物）
-    if getattr(c, 'deployMethod', 'direct') == 'docker':
-        deploy_steps = f"""      - uses: actions/checkout@v4
-      - name: Deploy with Docker
-        env:
-          SERVER_KEY: ${{{{ secrets.SERVER_SSH_KEY }}}}
-        run: |
-          mkdir -p ~/.ssh && echo "$SERVER_KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
-          tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
-              --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
-              -czf /tmp/${{PROJECT_NAME}}.tar.gz .
-          scp $SSH_OPTIONS /tmp/${{PROJECT_NAME}}.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/
-          ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST '
-              DEPLOY_DIR=$DEPLOY_PATH/${{PROJECT_NAME}}
-              mkdir -p "$DEPLOY_DIR"
-              tar -xzf /tmp/${{PROJECT_NAME}}.tar.gz -C "$DEPLOY_DIR"
-              rm -f /tmp/${{PROJECT_NAME}}.tar.gz
-              cd "$DEPLOY_DIR"
-              docker-compose down --remove-orphans 2>/dev/null || true
-              docker-compose up -d --build
-              docker image prune -f 2>/dev/null || true
-              docker-compose ps
-          '
-"""
+    # 部署 job：LB 滚动部署 > 多环境部署 > 默认部署
+    jobs = []
+    is_docker = getattr(c, 'deployMethod', 'direct') == 'docker'
+    if has_load_balancer(c):
+        jobs.append(_build_lb_deploy_job(c, integration))
     else:
-        deploy_cmd = _get_deploy_cmd(c)
-        deploy_steps = f"""      - uses: actions/checkout@v4
-      - name: Download artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: build-artifact
-      - name: Deploy
-        run: {deploy_cmd}
-"""
+        envs = get_environments(c)
+        if envs and is_docker:
+            for env in envs:
+                server = env.get('server') or {}
+                if server.get('host'):
+                    jobs.append(_build_docker_deploy_job(
+                        c, f"deploy-{env.get('name')}", integration,
+                        host=server.get('host'), user=server.get('username', 'root')))
+        if not jobs:
+            if is_docker:
+                jobs.append(_build_docker_deploy_job(c, "deploy", integration))
+            else:
+                jobs.append(_build_direct_deploy_job(c))
+    jobs_yaml = "\n".join(jobs)
+
+    # 多环境直接部署模式说明（GitHub 直接部署在 runner 本地运行，仅 Docker 模式支持多环境远程部署）
+    env_note = ""
+    if get_environments(c) and not is_docker and not has_load_balancer(c):
+        env_note = "# 注意：多环境远程部署仅支持 Docker 部署模式，当前模式将部署到默认目标\n"
 
     return f"""# GitHub Actions Deploy
 # 项目: {c.projectName}
 # 工具: GitHub Actions
 # 分支: {', '.join(branches)}
+{env_note}
 
 name: Deploy
 
@@ -263,11 +300,128 @@ env:
   PROJECT_NAME: "{c.projectName}"
 
 jobs:
-  deploy:
+{jobs_yaml}"""
+
+def _indent_run(script, spaces=10):
+    """将 run 脚本按 YAML 缩进格式化"""
+    pad = " " * spaces
+    return "\n".join(pad + line for line in script.splitlines())
+
+def _ssh_key_setup_line():
+    return 'mkdir -p ~/.ssh && echo "$SERVER_KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa'
+
+def _deploy_checkout_step(integration):
+    """部署 workflow 的 checkout 步骤（集成模式检出触发分支）"""
+    if integration:
+        return """      - uses: actions/checkout@v4
+        with:
+          ref: ${{{{ github.event.workflow_run.head_branch || github.ref_name }}}}
+"""
+    return """      - uses: actions/checkout@v4
+"""
+
+def _docker_deploy_run_script(c):
+    """Docker 部署 run 脚本：传输源码到目标服务器，docker-compose 构建运行"""
+    return f"""{_ssh_key_setup_line()}
+tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
+    --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
+    -czf /tmp/${{PROJECT_NAME}}.tar.gz .
+scp $SSH_OPTIONS /tmp/${{PROJECT_NAME}}.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/
+ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST '
+    DEPLOY_DIR=$DEPLOY_PATH/${{PROJECT_NAME}}
+    mkdir -p "$DEPLOY_DIR"
+    tar -xzf /tmp/${{PROJECT_NAME}}.tar.gz -C "$DEPLOY_DIR"
+    rm -f /tmp/${{PROJECT_NAME}}.tar.gz
+    cd "$DEPLOY_DIR"
+    docker-compose down --remove-orphans 2>/dev/null || true
+    docker-compose up -d --build
+    docker image prune -f 2>/dev/null || true
+    docker-compose ps
+'"""
+
+def _build_docker_deploy_job(c, job_name, integration, host=None, user=None):
+    """Docker 部署 job（多环境时通过 job 级 env 覆盖 SERVER_HOST/SERVER_USER）"""
+    env_name = job_name.removeprefix("deploy-") if host else ""
+    env_override = ""
+    if host:
+        env_override = f"""    env:
+      SERVER_HOST: "{host}"
+      SERVER_USER: "{user or 'root'}"
+"""
+    step_title = f"Deploy to {env_name} with Docker" if host else "Deploy with Docker"
+    integration_step = _build_integration_step(c) if integration else ""
+    return f"""  {job_name}:
+    runs-on: ubuntu-latest
+    if: ${{{{ github.event.workflow_run.conclusion == 'success' }}}}
+{env_override}    steps:
+{_deploy_checkout_step(integration)}{integration_step}      - name: {step_title}
+        env:
+          SERVER_KEY: ${{{{ secrets.SERVER_SSH_KEY }}}}
+        run: |
+{_indent_run(_docker_deploy_run_script(c))}
+"""
+
+def _lb_artifact_pack_cmd(c):
+    """LB 直接部署模式：打包构建产物为 {project}-artifact.tar.gz（滚动脚本约定）"""
+    p = c.projectName
+    pack_cmds = {
+        "java-maven": f"mkdir -p /tmp/lb-artifact && cp target/*.jar /tmp/lb-artifact/{p}.jar && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .",
+        "java-gradle": f"mkdir -p /tmp/lb-artifact && cp build/libs/*.jar /tmp/lb-artifact/{p}.jar && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .",
+        "vue": f"tar -czf {p}-artifact.tar.gz dist",
+        "react": f"tar -czf {p}-artifact.tar.gz dist",
+        "python": f"tar --exclude='.git' --exclude='__pycache__' -czf {p}-artifact.tar.gz .",
+        "go": f"mkdir -p /tmp/lb-artifact && cp ./app /tmp/lb-artifact/ && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .",
+    }
+    return pack_cmds.get(c.projectType, pack_cmds["python"])
+
+def _build_lb_deploy_job(c, integration):
+    """负载均衡滚动部署 job：打包后执行 deploy/rolling-deploy.sh"""
+    is_docker = getattr(c, 'deployMethod', 'direct') == 'docker'
+    if is_docker:
+        pack = """tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
+    --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
+    -czf /tmp/$PROJECT_NAME.tar.gz ."""
+        cleanup = "rm -f /tmp/$PROJECT_NAME.tar.gz"
+        download_step = ""
+    else:
+        pack = _lb_artifact_pack_cmd(c)
+        cleanup = f"rm -f {c.projectName}-artifact.tar.gz"
+        download_step = """      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+"""
+    integration_step = _build_integration_step(c) if integration else ""
+    run_script = f"""{_ssh_key_setup_line()}
+{pack}
+bash deploy/rolling-deploy.sh
+{cleanup}"""
+    return f"""  deploy:
     runs-on: ubuntu-latest
     if: ${{{{ github.event.workflow_run.conclusion == 'success' }}}}
     steps:
-{deploy_steps}"""
+{_deploy_checkout_step(integration)}{integration_step}{download_step}      - name: Deploy (负载均衡滚动部署)
+        env:
+          SERVER_KEY: ${{{{ secrets.SERVER_SSH_KEY }}}}
+        run: |
+{_indent_run(run_script)}
+"""
+
+def _build_direct_deploy_job(c):
+    """直接部署 job（沿用默认行为：下载产物在 runner 运行）"""
+    deploy_cmd = _get_deploy_cmd(c)
+    return f"""  deploy:
+    runs-on: ubuntu-latest
+    if: ${{{{ github.event.workflow_run.conclusion == 'success' }}}}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+      - name: Deploy
+        run: {deploy_cmd}
+"""
 
 def _build_release_workflow(c):
     """生成多分支发布流程 workflow（审批 + 合并 + 回滚）"""

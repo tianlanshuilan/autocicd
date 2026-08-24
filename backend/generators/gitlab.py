@@ -17,6 +17,12 @@ def generate_gitlab(config, output_dir):
         release_readme = build_release_readme(config)
         files.append({"name": "README-Release.md", "content": release_readme})
 
+    # 负载均衡文件：滚动部署脚本 + Nginx upstream 配置
+    from generators.lb import has_load_balancer, build_rolling_deploy_script, build_nginx_upstream_conf
+    if has_load_balancer(config):
+        files.append({"name": "deploy/rolling-deploy.sh", "content": build_rolling_deploy_script(config)})
+        files.append({"name": "deploy/nginx-lb.conf", "content": build_nginx_upstream_conf(config)})
+
     return files
 
 def _get_image(c):
@@ -99,6 +105,35 @@ def _get_deploy_scripts(c):
         ]
     return [_get_deploy_cmd(c)]
 
+def _get_lb_deploy_scripts(c):
+    """负载均衡滚动部署脚本行：打包后执行 deploy/rolling-deploy.sh
+
+    runner 镜像需具备 ssh/scp/curl（与现有 SSH 部署要求一致）。
+    """
+    p = c.projectName
+    if getattr(c, 'deployMethod', 'direct') == 'docker':
+        return [
+            "echo '负载均衡滚动部署（Docker 模式：打包源码）...'",
+            f"tar --exclude='.git' --exclude='node_modules' --exclude='target' --exclude='build' --exclude='dist' --exclude='.dep-repo' -czf /tmp/{p}.tar.gz .",
+            "bash deploy/rolling-deploy.sh",
+            f"rm -f /tmp/{p}.tar.gz",
+        ]
+    pack_cmds = {
+        "java-maven": f"mkdir -p /tmp/lb-artifact && cp target/*.jar /tmp/lb-artifact/{p}.jar && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .",
+        "java-gradle": f"mkdir -p /tmp/lb-artifact && cp build/libs/*.jar /tmp/lb-artifact/{p}.jar && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .",
+        "vue": f"tar -czf {p}-artifact.tar.gz dist",
+        "react": f"tar -czf {p}-artifact.tar.gz dist",
+        "python": f"tar --exclude='.git' --exclude='__pycache__' -czf {p}-artifact.tar.gz .",
+        "go": f"mkdir -p /tmp/lb-artifact && cp ./app /tmp/lb-artifact/ && tar -czf {p}-artifact.tar.gz -C /tmp/lb-artifact .",
+    }
+    pack = pack_cmds.get(c.projectType, pack_cmds["python"])
+    return [
+        "echo '负载均衡滚动部署（直接部署模式：打包产物）...'",
+        pack,
+        "bash deploy/rolling-deploy.sh",
+        f"rm -f {p}-artifact.tar.gz",
+    ]
+
 def _get_branches(c):
     """获取分支列表，兼容单分支和多分支"""
     branches = getattr(c, 'branches', None)
@@ -111,8 +146,15 @@ def _build_pipeline(c):
     build_script = _get_build_script(c)
     test_script = _get_test_script(c)
     artifacts_path = _get_artifacts_path(c)
-    deploy_block = "\n".join(f"    - {s}" for s in _get_deploy_scripts(c))
     branches = _get_branches(c)
+
+    # 部署脚本：负载均衡时走滚动部署
+    from generators.lb import has_load_balancer, is_integration_mode, get_environments
+    if has_load_balancer(c):
+        deploy_scripts = _get_lb_deploy_scripts(c)
+    else:
+        deploy_scripts = _get_deploy_scripts(c)
+    deploy_block = "\n".join(f"    - {s}" for s in deploy_scripts)
     
     # 服务器和堡垒机配置
     server_host = getattr(c, 'serverHost', '')
@@ -151,6 +193,33 @@ def _build_pipeline(c):
 """
         dep_repo_before = f"""    - git clone --branch $DEP_REPO_BRANCH --depth 1 $DEP_REPO_URL .dep-repo
 """
+
+    # 集成测试模式：功能分支临时合入环境集成分支（YAML anchor，供各 job 复用）
+    integration_anchor = ""
+    integration_before = ""
+    integration = is_integration_mode(c)
+    envs = get_environments(c)
+    if integration and envs:
+        env_branch = envs[0].get('branch') or envs[0].get('name', 'test')
+        integration_anchor = f"""
+# 集成测试模式：功能分支临时合入 {env_branch}（仅 CI 工作区，不推送远端）
+.integration_merge: &integration_merge |-
+  if [ "$CI_COMMIT_BRANCH" != "{env_branch}" ]; then
+    git config user.name "auto-cicd" && git config user.email "auto-cicd@local"
+    git fetch origin {env_branch} || true
+    git checkout -B {env_branch} origin/{env_branch} 2>/dev/null || git checkout -b {env_branch}
+    git merge "$CI_COMMIT_BRANCH" --no-edit || {{ echo "❌ 合并冲突，集成测试中止"; exit 1; }}
+    echo "✅ 已临时集成 $CI_COMMIT_BRANCH 到 {env_branch}"
+  fi
+"""
+        integration_before = "    - *integration_merge\n"
+
+    # only 限制：集成测试模式下任意分支触发
+    only_block = "" if integration else f"""  only:
+    - {branches[0]}
+"""
+    test_before = f"  before_script:\n{integration_before}" if integration_before else ""
+    deploy_before = f"  before_script:\n{integration_before}" if integration_before else ""
 
     # 多分支时生成并行 job
     if len(branches) > 1:
@@ -216,12 +285,51 @@ variables:
   SSH_OPTIONS: "{ssh_options}"
 {dep_repo_vars}{parallel_jobs}"""
 
+    # 多环境部署 job（Docker 模式，无负载均衡时）：job 级 variables 覆盖 SERVER_HOST/SERVER_USER
+    env_jobs = ""
+    use_env_jobs = False
+    if not has_load_balancer(c) and envs and getattr(c, 'deployMethod', 'direct') == 'docker':
+        jobs = []
+        for env in envs:
+            server = env.get('server') or {}
+            if not server.get('host'):
+                continue
+            safe_name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in env.get('name', 'env'))
+            env_before = f"  before_script:\n{integration_before}" if integration_before else ""
+            jobs.append(f"""
+deploy_{safe_name}:
+  stage: deploy
+  image: {image}
+  variables:
+    SERVER_HOST: "{server.get('host')}"
+    SERVER_USER: "{server.get('username', 'root')}"
+{env_before}  script:
+{deploy_block}
+{only_block}""")
+        if jobs:
+            env_jobs = "".join(jobs)
+            use_env_jobs = True
+
+    default_deploy_job = "" if use_env_jobs else f"""
+deploy_job:
+  stage: deploy
+  image: {image}
+{deploy_before}  script:
+{deploy_block}
+{only_block}"""
+
+    # 多环境直接部署模式说明（直接部署模式在 runner 本地运行，仅 Docker 模式支持多环境远程部署）
+    env_note = ""
+    if envs and getattr(c, 'deployMethod', 'direct') != 'docker' and not has_load_balancer(c):
+        env_note = "# 注意：多环境远程部署仅支持 Docker 部署模式，当前模式将部署到默认目标\n"
+
     return f"""# GitLab CI Pipeline
 # 项目: {c.projectName}
 # 工具: GitLab CI
 # 模式: {c.projectType}
 # 分支: {branch_list}
 # 生成: auto-cicd
+{env_note}
 
 stages:
   - build
@@ -236,12 +344,12 @@ variables:
   SERVER_USER: "{server_user}"
   DEPLOY_PATH: "{deploy_path}"
   SSH_OPTIONS: "{ssh_options}"
-{dep_repo_vars}
+{dep_repo_vars}{integration_anchor}
 build_job:
   stage: build
   image: {image}
   before_script:
-{dep_repo_before}  script:
+{integration_before}{dep_repo_before}  script:
     - {build_step}
   artifacts:
     paths:
@@ -251,16 +359,9 @@ build_job:
 test_job:
   stage: test
   image: {image}
-  script:
+{test_before}  script:
     - {test_script}
-
-deploy_job:
-  stage: deploy
-  image: {image}
-  script:
-{deploy_block}
-  only:
-    - {branches[0]}
+{default_deploy_job}{env_jobs}
 """
 
 def _build_dockerfile(c):

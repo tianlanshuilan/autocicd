@@ -21,6 +21,7 @@ STEPS = [
     {"id": "ssh_connect", "name": "连接目标服务器", "order": 5},
     {"id": "install_tool", "name": "安装 CI/CD 工具", "order": 6},
     {"id": "configure_pipeline", "name": "配置流水线", "order": 7},
+    {"id": "configure_cloud_service", "name": "配置云服务", "order": 8},
 ]
 
 
@@ -162,6 +163,16 @@ class PipelineEngine:
             results.append(result)
             if result["status"] == "failed":
                 return self._build_result(results, False)
+
+            # Step 8: 配置云服务（云托管服务需要）
+            # - aliyun/huawei/tencent: 通过 OpenAPI 创建流水线
+            # - github/gitlab: 流水线随配置文件推送自动启用，此步骤写入 Secrets/Variables
+            tool = self.config.get("tool", "jenkins")
+            if tool in ("aliyun", "huawei", "tencent", "github", "gitlab"):
+                result = await self._step_configure_cloud_service()
+                results.append(result)
+                if result["status"] == "failed":
+                    return self._build_result(results, False)
 
             success = all(r["status"] not in ("failed",) for r in results)
             return self._build_result(results, success)
@@ -817,6 +828,14 @@ class PipelineEngine:
             return {"step": step, "status": "failed", "message": "SSH 未连接"}
 
         try:
+            # 云托管工具（阿里云效/GitHub Actions/GitLab CI 等）无需安装 CI 工具，
+            # 仅需在部署目标服务器准备项目运行环境
+            if tool in ("aliyun", "huawei", "tencent", "github", "gitlab"):
+                await self.send_message(step, "running", "云托管服务无需安装 CI 工具，正在准备部署目标运行环境...")
+                await self._prepare_target_runtime(use_china_mirror)
+                await self._prepare_extra_runtimes(use_china_mirror)
+                return {"step": step, "status": "success", "message": "部署目标运行环境已就绪"}
+
             tool_names = {
                 "jenkins": "Jenkins",
                 "runner": "GitLab/GitHub Runner"
@@ -836,6 +855,9 @@ class PipelineEngine:
 
             # 在部署目标服务器上准备项目运行环境（Docker 或语言运行时）
             await self._prepare_target_runtime(use_china_mirror)
+
+            # 负载均衡/多环境：额外服务器运行环境准备
+            await self._prepare_extra_runtimes(use_china_mirror)
 
             return {"step": step, "status": "success", "message": f"{tool_name} 已安装"}
 
@@ -915,6 +937,138 @@ class PipelineEngine:
             # 运行环境准备失败不阻断流程，记录警告
             await self.send_message(step, "running", f"⚠️ 运行环境准备失败（{e}），部署前请确认目标服务器环境")
 
+    async def _prepare_extra_runtimes(self, use_china_mirror: bool = False):
+        """负载均衡/多环境：在额外服务器上准备运行环境（失败不阻断）
+
+        - 负载均衡后端服务器：按 deployMethod 准备 Docker/语言运行时
+        - 多环境服务器：同上
+        - 负载均衡服务器：安装 Nginx 并部署 upstream 配置
+        """
+        step = "install_tool"
+        loop = asyncio.get_event_loop()
+        log_cb = self._sync_log_factory(step)
+
+        lb = self.config.get("loadBalancer") or {}
+        lb_enabled = bool(lb.get("host") and lb.get("servers"))
+        envs = self.config.get("environments") or []
+        if not lb_enabled and not envs:
+            return
+
+        deploy_method = self.config.get("deployMethod", "direct")
+        project_type = self.config.get("projectType", "")
+        main_host = (self.config.get("server") or {}).get("host", "")
+
+        # 收集额外服务器（按 host 去重，跳过主服务器）
+        targets = []
+        if lb_enabled:
+            for i, s in enumerate(lb["servers"]):
+                if s.get("host") and s.get("host") != main_host:
+                    targets.append((s, f"负载均衡后端 #{i + 1}（{s['host']}）"))
+        for env in envs:
+            s = env.get("server") or {}
+            if s.get("host") and s.get("host") != main_host:
+                targets.append((s, f"{env.get('name', 'env')} 环境服务器（{s['host']}）"))
+
+        # 去重（同一 host 只准备一次）
+        seen = set()
+        for server, label in targets:
+            host = server["host"]
+            if host in seen:
+                continue
+            seen.add(host)
+            try:
+                await self.send_message(step, "running", f"正在准备{label}运行环境...")
+                ops = await self._connect_extra_server(server, label)
+                try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda ops=ops: ops.prepare_deploy_runtime(
+                            deploy_method, project_type, self.config, use_china_mirror, log_cb)
+                    )
+                finally:
+                    ops.close()
+            except Exception as e:
+                await self.send_message(step, "running", f"⚠️ {label}运行环境准备失败（{e}），部署前请手动确认")
+
+        # 负载均衡服务器：安装 Nginx 并部署 upstream 配置
+        if lb_enabled and lb.get("host") != main_host:
+            try:
+                await self.send_message(step, "running", f"正在配置负载均衡服务器 {lb['host']}（Nginx）...")
+                ops = await self._connect_extra_server(lb, f"负载均衡服务器 {lb['host']}")
+                try:
+                    await loop.run_in_executor(None, lambda: self._setup_lb_nginx_sync(ops, log_cb))
+                finally:
+                    ops.close()
+            except Exception as e:
+                await self.send_message(step, "running", f"⚠️ 负载均衡服务器配置失败（{e}），请手动安装 Nginx 并部署 deploy/nginx-lb.conf")
+
+    async def _connect_extra_server(self, server: dict, label: str):
+        """连接额外服务器（负载均衡后端/环境服务器/LB 服务器），复用跳转链路"""
+        server_cred = {
+            "authType": server.get("authType", "password"),
+            "password": server.get("password", ""),
+            "sshKey": server.get("sshKey", ""),
+        }
+        if server_cred["authType"] == "password" and not server_cred["password"]:
+            cred = await self.request_credential("server", f"需要{label}密码")
+            if cred:
+                server_cred.update(cred)
+            else:
+                raise SSHError(f"{label}凭据缺失")
+        if server_cred["authType"] in ("ssh_key", "sshKey") and not server_cred["sshKey"]:
+            cred = await self.request_credential("server", f"需要{label} SSH 密钥")
+            if cred:
+                server_cred.update(cred)
+            else:
+                raise SSHError(f"{label}凭据缺失")
+
+        ops = SSHOps(
+            host=server.get("host", ""),
+            port=server.get("port", 22),
+            username=server.get("username", "root"),
+            credential=server_cred,
+            jump_chain=self.jump_chain,
+        )
+        log_cb = self._sync_log_factory("install_tool")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: ops.connect(log_cb))
+        return ops
+
+    def _setup_lb_nginx_sync(self, ops, log_cb):
+        """在负载均衡服务器上安装 Nginx 并部署 upstream 配置（同步）"""
+        import os
+        import tempfile
+        from generators.lb import build_nginx_upstream_conf
+
+        class _AttrDict:
+            """dict 配置的属性访问适配器（lb 生成函数使用 getattr）"""
+            def __init__(self, d):
+                self.__dict__.update(d)
+
+        project_name = self.config.get("projectName", "app")
+        conf_content = build_nginx_upstream_conf(_AttrDict(self.config))
+
+        # 安装 Nginx（幂等）
+        ops.exec_command(
+            "command -v nginx >/dev/null 2>&1 && echo 'Nginx 已安装' || "
+            "{ (apt-get update -qq && apt-get install -y nginx) || yum install -y nginx; }",
+            log_callback=log_cb, timeout=600)
+
+        # 上传 upstream 配置并 reload
+        fd, tmp_path = tempfile.mkstemp(suffix=".conf", prefix="nginx-lb-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(conf_content)
+            remote_conf = f"/etc/nginx/conf.d/{project_name}-lb.conf"
+            ops.upload_file(tmp_path, remote_conf, log_callback=log_cb)
+        finally:
+            os.unlink(tmp_path)
+
+        ops.exec_command(
+            f"nginx -t && (nginx -s reload 2>/dev/null || systemctl restart nginx) && "
+            f"echo 'Nginx 负载均衡配置已生效: {remote_conf}'",
+            log_callback=log_cb, timeout=120)
+
     async def _step_configure_pipeline(self) -> dict:
         """Step 7: 配置流水线（创建 Job、设置凭据、配置 Webhook）"""
         step = "configure_pipeline"
@@ -983,142 +1137,231 @@ class PipelineEngine:
             await self.send_message(step, "failed", str(e))
             return {"step": step, "status": "failed", "message": str(e)}
 
-    async def _step_approval(self) -> dict:
-        """审批确认 - 等待用户确认是否合并到主分支"""
-        step = "approval"
-        release_strategy = self.config.get("releaseStrategy", {})
-        main_branch = release_strategy.get("mainBranch", "main")
-        branches = self.config.get("branches", [])
+    async def _step_configure_cloud_service(self) -> dict:
+        """Step 8: 配置云服务（云效/CodeArts 等云托管服务）"""
+        step = "configure_cloud_service"
+        tool = self.config.get("tool", "aliyun")
+        
+        try:
+            if tool == "aliyun":
+                await self.send_message(step, "running", "正在配置阿里云效流水线...")
+                
+                # 获取云服务凭据
+                cloud_cred = self.config.get("cloudCredential", {})
+                if not cloud_cred.get("accessKeyId") or not cloud_cred.get("accessKeySecret"):
+                    cred = await self.request_credential("cloud", "需要阿里云 AccessKey 才能配置云效流水线")
+                    if cred:
+                        cloud_cred.update(cred)
+                        self.config["cloudCredential"] = cloud_cred
+                    else:
+                        await self.send_message(step, "failed", "用户取消了凭据输入")
+                        return {"step": step, "status": "failed", "message": "凭据缺失"}
+                
+                # 导入云效客户端
+                from cloud.aliyun_devops import AliyunDevOpsClient, AliyunDevOpsError
+                
+                log_cb = self._sync_log_factory(step)
+                loop = asyncio.get_event_loop()
+                
+                # 创建云效客户端并配置流水线
+                def configure_aliyun():
+                    client = AliyunDevOpsClient(
+                        access_key_id=cloud_cred.get("accessKeyId"),
+                        access_key_secret=cloud_cred.get("accessKeySecret"),
+                        region_id=cloud_cred.get("regionId", "cn_hangzhou")
+                    )
+                    
+                    # 创建项目（如果未指定组织 ID）
+                    project_name = self.config.get("projectName", "app")
+                    org_id = cloud_cred.get("organizationId", "")
+                    
+                    log_cb(f"创建云效项目: {project_name}")
+                    project = client.create_project(
+                        name=project_name,
+                        description=f"CI/CD 自动搭建项目 - {project_name}",
+                        organization_id=org_id
+                    )
+                    log_cb(f"项目创建成功: {project['url']}")
+                    
+                    # 创建代码源服务连接
+                    log_cb("配置代码源连接...")
+                    repo_url = self.config.get("repoUrl", "")
+                    connection = client.create_service_connection(
+                        project_id=project["project_id"],
+                        name="代码仓库",
+                        connection_type="git",
+                        config={
+                            "url": repo_url,
+                            "authType": self.config.get("gitAuth", {}).get("type", "password"),
+                            "username": self.config.get("gitAuth", {}).get("username", ""),
+                            "password": self.config.get("gitAuth", {}).get("password", ""),
+                        }
+                    )
+                    log_cb(f"代码源连接创建成功: {connection['connection_id']}")
+                    
+                    # 创建流水线
+                    log_cb("创建流水线...")
+                    pipeline = client.create_pipeline(
+                        project_id=project["project_id"],
+                        name=f"{project_name}-pipeline",
+                        service_connection_id=connection["connection_id"],
+                        repo_url=repo_url,
+                        branch=self.config.get("branch", "main")
+                    )
+                    log_cb(f"流水线创建成功: {pipeline['url']}")
+                    
+                    return {
+                        "project": project,
+                        "connection": connection,
+                        "pipeline": pipeline
+                    }
+                
+                result = await loop.run_in_executor(None, configure_aliyun)
+                
+                await self.send_message(
+                    step, 
+                    "success", 
+                    f"云效流水线配置完成！项目: {result['project']['url']}"
+                )
+                return {
+                    "step": step, 
+                    "status": "success", 
+                    "message": "云效流水线已就绪",
+                    "data": result
+                }
+            
+            elif tool == "github":
+                # GitHub Actions: 流水线随配置文件推送自动启用，此步骤写入 Secrets
+                return await self._configure_github_secrets(step)
 
-        await self.send_message(
-            step,
-            "waiting_input",
-            f"测试部署完成，是否合并到主分支 {main_branch}？",
-            "approval"
-        )
+            elif tool == "gitlab":
+                # GitLab CI: 流水线随配置文件推送自动启用，此步骤写入 CI/CD Variables
+                return await self._configure_gitlab_variables(step)
 
-        # 等待前端回复审批结果
-        if self._credential_waiter:
-            future = asyncio.get_event_loop().create_future()
-            self._credential_waiter = future
-            credential = await future
-            self._credential_waiter = None
-
-            if credential:
-                action = credential.get("action", "merge")
-                if action == "merge":
-                    await self.send_message(step, "success", f"审批通过，准备合并到 {main_branch}")
-                    return {"step": step, "status": "success", "message": "审批通过", "action": "merge"}
-                elif action == "reject":
-                    await self.send_message(step, "success", "审批拒绝，不合并到主分支")
-                    return {"step": step, "status": "success", "message": "已拒绝合并", "action": "reject"}
-                elif action == "rollback":
-                    await self.send_message(step, "success", "审批回滚，将回滚到上一稳定版本")
-                    return {"step": step, "status": "success", "message": "执行回滚", "action": "rollback"}
+            elif tool in ("huawei", "tencent"):
+                # 华为云和腾讯云暂不支持 API 自动配置，提示用户手动配置
+                await self.send_message(
+                    step, 
+                    "running", 
+                    f"云托管服务 {tool} 的 API 自动配置暂未实现，配置文件已推送到仓库，请手动在控制台导入"
+                )
+                await self.send_message(step, "success", f"{tool} 配置文件已就绪，请手动导入")
+                return {
+                    "step": step, 
+                    "status": "success", 
+                    "message": f"{tool} 配置文件已推送到仓库"
+                }
+            
             else:
-                await self.send_message(step, "failed", "用户取消了审批")
-                return {"step": step, "status": "failed", "message": "审批取消"}
-
-        # 默认通过
-        await self.send_message(step, "success", f"审批通过，准备合并到 {main_branch}")
-        return {"step": step, "status": "success", "message": "审批通过", "action": "merge"}
-
-    async def _step_merge(self) -> dict:
-        """Step 8: 合并到主分支"""
-        step = "merge"
-        release_strategy = self.config.get("releaseStrategy", {})
-        main_branch = release_strategy.get("mainBranch", "main")
-        branches = self.config.get("branches", [])
-
-        await self.send_message(step, "running", f"正在合并分支到 {main_branch}...")
-
-        if not self.git_ops:
-            await self.send_message(step, "failed", "Git 未初始化")
-            return {"step": step, "status": "failed", "message": "Git 未初始化"}
-
-        try:
-            log_cb = self._sync_log_factory(step)
-            loop = asyncio.get_event_loop()
-
-            # 执行合并操作
-            async def do_merge():
-                for branch in branches:
-                    if branch == main_branch:
-                        continue
-                    log_cb(f"合并 {branch} 到 {main_branch}...")
-                    # 这里通过 Git 命令执行合并
-                    import subprocess
-                    env = self.git_ops._get_env()
-                    cwd = self.git_ops.work_dir
-
-                    # 切换到主分支
-                    subprocess.run(["git", "checkout", main_branch], cwd=cwd, env=env, check=True, capture_output=True)
-                    # 合并分支
-                    subprocess.run(["git", "merge", f"origin/{branch}", "--no-edit"], cwd=cwd, env=env, check=True, capture_output=True)
-                    # 打标签
-                    from datetime import datetime
-                    tag = f"v{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    subprocess.run(["git", "tag", tag], cwd=cwd, env=env, check=True, capture_output=True)
-                    # 推送
-                    subprocess.run(["git", "push", "origin", main_branch, "--tags"], cwd=cwd, env=env, check=True, capture_output=True)
-                    log_cb(f"✅ {branch} 已合并到 {main_branch}，标签: {tag}")
-
-            await loop.run_in_executor(None, lambda: asyncio.run(do_merge()) if False else None)
-
-            # 简化版：直接通过 SSH 执行
-            if self.ssh_ops:
-                def _merge_via_ssh():
-                    for branch in branches:
-                        if branch == main_branch:
-                            continue
-                        log_cb(f"合并 {branch} 到 {main_branch}...")
-                        cmd = f"cd /opt/apps && git checkout {main_branch} && git merge origin/{branch} --no-edit && git push origin {main_branch}"
-                        self.ssh_ops._exec(cmd, log_cb)
-                        log_cb(f"✅ {branch} 已合并到 {main_branch}")
-
-                await loop.run_in_executor(None, _merge_via_ssh)
-
-            await self.send_message(step, "success", f"已合并所有分支到 {main_branch}")
-            return {"step": step, "status": "success", "message": f"合并完成到 {main_branch}"}
-
+                await self.send_message(step, "success", "云服务配置完成")
+                return {"step": step, "status": "success", "message": "云服务已就绪"}
+        
         except Exception as e:
-            await self.send_message(step, "failed", f"合并失败: {str(e)}")
-            return {"step": step, "status": "failed", "message": str(e)}
+            error_msg = f"配置云服务失败: {str(e)}"
+            await self.send_message(step, "failed", error_msg)
+            return {"step": step, "status": "failed", "message": error_msg}
 
-    async def _step_rollback(self) -> dict:
-        """回滚到上一稳定版本"""
-        step = "merge"
-        release_strategy = self.config.get("releaseStrategy", {})
-        main_branch = release_strategy.get("mainBranch", "main")
+    def _collect_cloud_secrets(self) -> dict:
+        """收集需要写入云平台的敏感值（Secrets/CI Variables）
 
-        await self.send_message(step, "running", f"正在回滚 {main_branch} 到上一稳定版本...")
+        - SERVER_SSH_KEY: 部署目标服务器的 SSH 私钥（SSH 部署阶段使用）
+        - DEP_REPO_TOKEN: 独立依赖仓库的访问凭据（克隆依赖仓库使用）
+        """
+        server = self.config.get("server", {}) or {}
+        dep_repo = self.config.get("dependencyRepo", {}) or {}
+        secrets = {}
+        if server.get("sshKey"):
+            secrets["SERVER_SSH_KEY"] = server["sshKey"]
+        if dep_repo.get("url") and dep_repo.get("password"):
+            secrets["DEP_REPO_TOKEN"] = dep_repo["password"]
+        return secrets
 
-        try:
-            log_cb = self._sync_log_factory(step)
-            loop = asyncio.get_event_loop()
+    async def _configure_github_secrets(self, step: str) -> dict:
+        """GitHub Actions: 将 Secrets 写入仓库（需要 PAT）
 
-            if self.ssh_ops:
-                def _rollback():
-                    log_cb("查找上一稳定版本标签...")
-                    cmd = "git tag --sort=-creatordate | grep '^v[0-9]' | head -2 | tail -1"
-                    result = self.ssh_ops._exec(cmd, log_cb)
-                    prev_tag = result.strip() if result else ""
+        流水线已随 .github/workflows 推送自动启用；
+        未提供 Token 时跳过并提示手动配置（保持向后兼容）。
+        """
+        cloud_cred = self.config.get("cloudCredential", {}) or {}
+        token = cloud_cred.get("token", "")
+        secrets = self._collect_cloud_secrets()
 
-                    if not prev_tag:
-                        raise Exception("未找到可回滚的版本标签")
+        if not secrets:
+            await self.send_message(step, "success", "GitHub Actions 流水线已启用，无需配置 Secrets")
+            return {"step": step, "status": "success", "message": "流水线已启用"}
 
-                    log_cb(f"回滚到版本: {prev_tag}")
-                    self.ssh_ops._exec(f"git checkout {prev_tag}", log_cb)
-                    log_cb(f"✅ 回滚完成，已回滚到 {prev_tag}")
+        secret_names = ", ".join(secrets.keys())
+        if not token:
+            msg = (f"GitHub Actions 流水线已启用。请在仓库 Settings → Secrets and variables → Actions "
+                   f"中手动添加以下 Secrets: {secret_names}")
+            await self.send_message(step, "success", msg)
+            return {"step": step, "status": "success", "message": "流水线已启用，Secrets 需手动配置"}
 
-                await loop.run_in_executor(None, _rollback)
+        await self.send_message(step, "running", f"正在通过 API 写入 GitHub Secrets: {secret_names}")
+        log_cb = self._sync_log_factory(step)
+        loop = asyncio.get_event_loop()
 
-            await self.send_message(step, "success", "回滚完成")
-            return {"step": step, "status": "success", "message": "回滚完成"}
+        def write_secrets():
+            from cloud.github_api import GitHubApiClient, GitHubApiError
+            with GitHubApiClient(token) as client:
+                client.verify_token()
+                owner, repo = GitHubApiClient.parse_repo_owner_name(self.config.get("repoUrl", ""))
+                client.get_repo(owner, repo)
+                log_cb(f"仓库验证通过: {owner}/{repo}")
+                written = client.set_secrets(owner, repo, secrets, log_cb)
+                return owner, repo, written
 
-        except Exception as e:
-            await self.send_message(step, "failed", f"回滚失败: {str(e)}")
-            return {"step": step, "status": "failed", "message": str(e)}
+        owner, repo, written = await loop.run_in_executor(None, write_secrets)
+        await self.send_message(
+            step, "success",
+            f"GitHub Secrets 配置完成（{owner}/{repo}）: {', '.join(written) or '无'}"
+        )
+        return {"step": step, "status": "success", "message": f"已写入 {len(written)} 个 Secrets",
+                "data": {"repo": f"{owner}/{repo}", "secrets": written}}
+
+    async def _configure_gitlab_variables(self, step: str) -> dict:
+        """GitLab CI: 将敏感值写入项目 CI/CD Variables（需要 Token）
+
+        流水线已随 .gitlab-ci.yml 推送自动启用；
+        未提供 Token 时跳过并提示手动配置（保持向后兼容）。
+        """
+        cloud_cred = self.config.get("cloudCredential", {}) or {}
+        token = cloud_cred.get("token", "")
+        base_url = cloud_cred.get("baseUrl", "") or "https://gitlab.com"
+        variables = self._collect_cloud_secrets()
+
+        if not variables:
+            await self.send_message(step, "success", "GitLab 流水线已启用，无需配置 CI/CD 变量")
+            return {"step": step, "status": "success", "message": "流水线已启用"}
+
+        var_names = ", ".join(variables.keys())
+        if not token:
+            msg = (f"GitLab 流水线已启用。请在项目 Settings → CI/CD → Variables "
+                   f"中手动添加以下变量: {var_names}")
+            await self.send_message(step, "success", msg)
+            return {"step": step, "status": "success", "message": "流水线已启用，变量需手动配置"}
+
+        await self.send_message(step, "running", f"正在通过 API 写入 GitLab CI/CD 变量: {var_names}")
+        log_cb = self._sync_log_factory(step)
+        loop = asyncio.get_event_loop()
+
+        def write_variables():
+            from cloud.gitlab_api import GitLabApiClient, GitLabApiError
+            with GitLabApiClient(token, base_url) as client:
+                client.verify_token()
+                project_path = GitLabApiClient.parse_project_path(self.config.get("repoUrl", ""))
+                project = client.get_project(project_path)
+                log_cb(f"项目验证通过: {project_path} (ID: {project['id']})")
+                written = client.set_variables(project["id"], variables, log_cb)
+                return project_path, written
+
+        project_path, written = await loop.run_in_executor(None, write_variables)
+        await self.send_message(
+            step, "success",
+            f"GitLab CI/CD 变量配置完成（{project_path}）: {', '.join(written) or '无'}"
+        )
+        return {"step": step, "status": "success", "message": f"已写入 {len(written)} 个变量",
+                "data": {"project": project_path, "variables": written}}
 
     def _build_result(self, results: list, success: bool, error: str = "") -> dict:
         """构建最终结果"""
