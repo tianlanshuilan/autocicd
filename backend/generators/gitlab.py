@@ -94,13 +94,16 @@ def _get_deploy_cmd(c):
     return "echo deploy"
 
 def _get_deploy_scripts(c):
-    """返回部署脚本行列表。Docker 模式传输源码到目标服务器并 docker-compose 构建运行。"""
+    """返回部署脚本行列表。Docker 模式传输源码到目标服务器并 docker-compose 构建运行。
+
+    支持密钥与密码两种 SSH 认证方式（通过 AUTH_PREFIX 变量统一前缀）。
+    """
     if getattr(c, 'deployMethod', 'direct') == 'docker':
         return [
             "echo 'Deploying with Docker...'",
             "tar --exclude='.git' --exclude='node_modules' --exclude='target' --exclude='build' --exclude='dist' --exclude='.dep-repo' -czf /tmp/$CI_PROJECT_NAME.tar.gz .",
-            "scp $SSH_OPTIONS /tmp/$CI_PROJECT_NAME.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/",
-            "ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST 'DEPLOY_DIR=$DEPLOY_PATH/$CI_PROJECT_NAME; mkdir -p $DEPLOY_DIR; tar -xzf /tmp/$CI_PROJECT_NAME.tar.gz -C $DEPLOY_DIR; rm -f /tmp/$CI_PROJECT_NAME.tar.gz; cd $DEPLOY_DIR; docker-compose down --remove-orphans 2>/dev/null || true; docker-compose up -d --build; docker image prune -f 2>/dev/null || true; docker-compose ps'",
+            "$AUTH_PREFIX scp $SSH_OPTIONS /tmp/$CI_PROJECT_NAME.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/",
+            "$AUTH_PREFIX ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST 'DEPLOY_DIR=$DEPLOY_PATH/$CI_PROJECT_NAME; mkdir -p $DEPLOY_DIR; tar -xzf /tmp/$CI_PROJECT_NAME.tar.gz -C $DEPLOY_DIR; rm -f /tmp/$CI_PROJECT_NAME.tar.gz; cd $DEPLOY_DIR; docker-compose down --remove-orphans 2>/dev/null || true; docker-compose up -d --build; docker image prune -f 2>/dev/null || true; docker-compose ps'",
             "rm -f /tmp/$CI_PROJECT_NAME.tar.gz",
         ]
     return [_get_deploy_cmd(c)]
@@ -218,8 +221,12 @@ def _build_pipeline(c):
     only_block = "" if integration else f"""  only:
     - {branches[0]}
 """
+
+    # SSH 认证设置：deploy job 的 before_script 始终包含（密钥优先，回退 sshpass）
+    from generators.lb import gitlab_ssh_setup_block
+    ssh_auth_lines = "".join(f"    - {line}\n" for line in gitlab_ssh_setup_block().splitlines())
+    deploy_before = f"  before_script:\n{integration_before}{ssh_auth_lines}"
     test_before = f"  before_script:\n{integration_before}" if integration_before else ""
-    deploy_before = f"  before_script:\n{integration_before}" if integration_before else ""
 
     # 多分支时生成并行 job
     if len(branches) > 1:
@@ -259,7 +266,8 @@ deploy_{safe_name}:
   image: {image}
   variables:
     BRANCH: "{b}"
-  script:
+  before_script:
+{ssh_auth_lines}  script:
 {deploy_block}
   only:
     - {b}
@@ -295,7 +303,7 @@ variables:
             if not server.get('host'):
                 continue
             safe_name = "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in env.get('name', 'env'))
-            env_before = f"  before_script:\n{integration_before}" if integration_before else ""
+            env_before = f"  before_script:\n{integration_before}{ssh_auth_lines}"
             jobs.append(f"""
 deploy_{safe_name}:
   stage: deploy

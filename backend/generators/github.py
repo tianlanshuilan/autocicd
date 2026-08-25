@@ -298,6 +298,9 @@ env:
   DEPLOY_PATH: "{deploy_path}"
   SSH_OPTIONS: "{ssh_options}"
   PROJECT_NAME: "{c.projectName}"
+  SERVER_KEY: ${{{{ secrets.SERVER_SSH_KEY }}}}
+  SERVER_PASSWORD: ${{{{ secrets.SERVER_PASSWORD }}}}
+  SSHPASS: ${{{{ secrets.SERVER_PASSWORD }}}}
 
 jobs:
 {jobs_yaml}"""
@@ -321,13 +324,17 @@ def _deploy_checkout_step(integration):
 """
 
 def _docker_deploy_run_script(c):
-    """Docker 部署 run 脚本：传输源码到目标服务器，docker-compose 构建运行"""
-    return f"""{_ssh_key_setup_line()}
+    """Docker 部署 run 脚本：传输源码到目标服务器，docker-compose 构建运行
+
+    支持密钥与密码两种 SSH 认证方式：通过 AUTH_PREFIX 统一前缀。
+    """
+    from generators.lb import github_ssh_setup_block
+    return f"""{github_ssh_setup_block()}
 tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
     --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
     -czf /tmp/${{PROJECT_NAME}}.tar.gz .
-scp $SSH_OPTIONS /tmp/${{PROJECT_NAME}}.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/
-ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST '
+$AUTH_PREFIX scp $SSH_OPTIONS /tmp/${{PROJECT_NAME}}.tar.gz $SERVER_USER@$SERVER_HOST:/tmp/
+$AUTH_PREFIX ssh $SSH_OPTIONS $SERVER_USER@$SERVER_HOST '
     DEPLOY_DIR=$DEPLOY_PATH/${{PROJECT_NAME}}
     mkdir -p "$DEPLOY_DIR"
     tar -xzf /tmp/${{PROJECT_NAME}}.tar.gz -C "$DEPLOY_DIR"
@@ -392,7 +399,8 @@ def _build_lb_deploy_job(c, integration):
           name: build-artifact
 """
     integration_step = _build_integration_step(c) if integration else ""
-    run_script = f"""{_ssh_key_setup_line()}
+    from generators.lb import github_ssh_setup_block
+    run_script = f"""{github_ssh_setup_block()}
 {pack}
 bash deploy/rolling-deploy.sh
 {cleanup}"""

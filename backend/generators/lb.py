@@ -12,6 +12,9 @@
 3. 流水线模式（pipelineMode）
    - release：部署验证后合并到主分支（发布流程）
    - integration：功能分支临时合入环境集成分支做集成测试，不合入主干
+
+4. SSH 认证辅助
+   - 统一密钥认证与密码认证（sshpass）的凭据设置片段
 """
 
 
@@ -62,6 +65,76 @@ def get_load_balancer(c) -> dict:
 
 def has_load_balancer(c) -> bool:
     return bool(get_load_balancer(c))
+
+
+# ============================================================
+# SSH 认证辅助（密钥 / sshpass 密码两种模式）
+# ============================================================
+
+def get_server_auth_type(c) -> str:
+    """判断目标服务器的 SSH 认证方式：'ssh_key' | 'password'
+
+    优先使用 c.server.sshKey；其次使用 c.serverAuthType；默认 password。
+    """
+    server = getattr(c, 'server', None)
+    if server:
+        if hasattr(server, 'model_dump'):
+            server = server.model_dump()
+        if isinstance(server, dict) and server.get('sshKey'):
+            return 'ssh_key'
+    auth = getattr(c, 'serverAuthType', '')
+    if auth == 'ssh_key':
+        return 'ssh_key'
+    return 'password'
+
+
+def github_ssh_setup_block(github_env_name: str = "$GITHUB_ENV") -> str:
+    """GitHub Actions run 块：设置 SSH 认证（密钥或 sshpass）
+
+    执行后在 $GITHUB_ENV 写入 AUTH_PREFIX 供后续 ssh/scp 使用：
+    - 密钥模式：AUTH_PREFIX 为空，写入 ~/.ssh/id_rsa
+    - 密码模式：AUTH_PREFIX=sshpass -e，SSHPASS 从 job env 读取
+    """
+    return """if [ -n "$SERVER_KEY" ]; then
+  mkdir -p ~/.ssh
+  echo "$SERVER_KEY" > ~/.ssh/id_rsa
+  chmod 600 ~/.ssh/id_rsa
+  echo "AUTH_PREFIX=" >> """ + github_env_name + """
+else
+  command -v sshpass >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq sshpass 2>/dev/null) || (sudo yum install -y sshpass 2>/dev/null)
+  echo "AUTH_PREFIX=sshpass -e" >> """ + github_env_name + """
+fi"""
+
+
+def gitlab_ssh_setup_block() -> str:
+    """GitLab CI before_script：设置 SSH 认证（密钥或 sshpass）
+
+    export AUTH_PREFIX，在同一个 shell 会话中的后续 script 项生效。
+    """
+    return """if [ -n "$SERVER_SSH_KEY" ]; then
+  mkdir -p ~/.ssh && echo "$SERVER_SSH_KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
+  export AUTH_PREFIX=""
+else
+  command -v sshpass >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq sshpass 2>/dev/null) || (yum install -y sshpass 2>/dev/null) || (sudo apt-get install -y sshpass 2>/dev/null)
+  export SSHPASS="$SERVER_PASSWORD"
+  export AUTH_PREFIX="sshpass -e"
+fi"""
+
+
+def rolling_deploy_ssh_setup() -> str:
+    """滚动部署脚本 SSH 认证设置（bash，使用 AUTH_PREFIX 变量）
+
+    密钥模式：写 id_rsa，AUTH_PREFIX 为空
+    密码模式：从 SERVER_PASSWORD 环境变量读取，AUTH_PREFIX=sshpass -e
+    """
+    return """if [ -n "$SERVER_KEY" ]; then
+    mkdir -p ~/.ssh && echo "$SERVER_KEY" > ~/.ssh/id_rsa && chmod 600 ~/.ssh/id_rsa
+    AUTH_PREFIX=""
+else
+    command -v sshpass >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y sshpass 2>/dev/null) || (yum install -y sshpass 2>/dev/null)
+    export SSHPASS="$SERVER_PASSWORD"
+    AUTH_PREFIX="sshpass -e"
+fi"""
 
 
 # ============================================================
@@ -153,8 +226,8 @@ def build_rolling_deploy_script(c, ssh_options: str = "-o StrictHostKeyChecking=
 
     if deploy_method == 'docker':
         deploy_cmds = f"""    # Docker 模式：传输源码，docker-compose 构建运行
-    scp $SSH_OPTIONS /tmp/{project_name}.tar.gz $USER@$HOST:/tmp/
-    ssh $SSH_OPTIONS $USER@$HOST "
+    $AUTH_PREFIX scp $SSH_OPTIONS /tmp/{project_name}.tar.gz $USER@$HOST:/tmp/
+    $AUTH_PREFIX ssh $SSH_OPTIONS $USER@$HOST "
         DEPLOY_DIR=$DEPLOY_PATH/{project_name}
         mkdir -p \\"$DEPLOY_DIR\\"
         tar -xzf /tmp/{project_name}.tar.gz -C \\"$DEPLOY_DIR\\"
@@ -167,8 +240,8 @@ def build_rolling_deploy_script(c, ssh_options: str = "-o StrictHostKeyChecking=
     else:
         start_cmd = _get_direct_start_cmd(project_type, project_name, backend_port)
         deploy_cmds = f"""    # 直接部署模式：传输产物并启动
-    scp $SSH_OPTIONS {project_name}-artifact.tar.gz $USER@$HOST:/tmp/
-    ssh $SSH_OPTIONS $USER@$HOST "
+    $AUTH_PREFIX scp $SSH_OPTIONS {project_name}-artifact.tar.gz $USER@$HOST:/tmp/
+    $AUTH_PREFIX ssh $SSH_OPTIONS $USER@$HOST "
         DEPLOY_DIR=$DEPLOY_PATH/{project_name}
         mkdir -p \\"$DEPLOY_DIR\\"
         tar -xzf /tmp/{project_name}-artifact.tar.gz -C \\"$DEPLOY_DIR\\"
@@ -181,6 +254,7 @@ def build_rolling_deploy_script(c, ssh_options: str = "-o StrictHostKeyChecking=
     "
     HEALTH_PORT={backend_port}"""
 
+    ssh_setup = rolling_deploy_ssh_setup()
     return f"""#!/bin/bash
 # 滚动部署脚本 - {project_name}
 # 生成: auto-cicd
@@ -194,6 +268,9 @@ DEPLOY_PATHS=({path_map})
 HEALTH_PATH="{health_path}"
 RETRIES={retries}
 TOTAL=${{#SERVERS[@]}}
+
+# SSH 认证设置（密钥优先，回退 sshpass 密码认证）
+{ssh_setup}
 
 echo "[rolling] 开始滚动部署: $TOTAL 台后端服务器"
 

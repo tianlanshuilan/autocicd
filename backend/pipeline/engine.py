@@ -514,6 +514,10 @@ class PipelineEngine:
                 setattr(cfg, 'serverUser', server_config.get('username', 'root'))
                 setattr(cfg, 'deployPath', server_config.get('deployPath', '/opt/apps'))
                 setattr(cfg, 'backupBeforeDeploy', server_config.get('backupBeforeDeploy', True))
+                # SSH 认证方式（ssh_key / password），供生成器判断部署凭据路径
+                setattr(cfg, 'serverAuthType', server_config.get('authType', 'password'))
+                setattr(cfg, 'serverPassword', server_config.get('password', ''))
+                setattr(cfg, 'serverSshKey', server_config.get('sshKey', ''))
 
             # 从 networkAccess.hops 中提取堡垒机信息（用于生成的 Pipeline 穿透访问）
             network_access = self.config.get("networkAccess", {})
@@ -1111,6 +1115,17 @@ class PipelineEngine:
                     await self.send_message(step, "failed", "SSH 未连接")
                     return {"step": step, "status": "failed", "message": "SSH 未连接"}
 
+                # 请求 Runner 注册 token（从 GitLab/GitHub UI 获取）
+                registration_token = self.config.get("runnerToken", "")
+                if not registration_token:
+                    cred = await self.request_credential(
+                        "runner_token",
+                        "请输入 Runner 注册 Token（从 GitLab → Settings → CI/CD → Runners 获取）"
+                    )
+                    if cred and cred.get("token"):
+                        registration_token = cred["token"]
+                        self.config["runnerToken"] = registration_token
+
                 log_cb = self._sync_log_factory(step)
                 loop = asyncio.get_event_loop()
 
@@ -1119,6 +1134,7 @@ class PipelineEngine:
                     lambda: self.ssh_ops.configure_runner(
                         repo_url=self.config.get("repoUrl", ""),
                         git_credential=self.config.get("gitAuth"),
+                        registration_token=registration_token,
                         log_callback=log_cb
                     )
                 )
@@ -1265,6 +1281,7 @@ class PipelineEngine:
         """收集需要写入云平台的敏感值（Secrets/CI Variables）
 
         - SERVER_SSH_KEY: 部署目标服务器的 SSH 私钥（SSH 部署阶段使用）
+        - SERVER_PASSWORD: 部署目标服务器密码（sshpass 模式使用）
         - DEP_REPO_TOKEN: 独立依赖仓库的访问凭据（克隆依赖仓库使用）
         """
         server = self.config.get("server", {}) or {}
@@ -1272,6 +1289,8 @@ class PipelineEngine:
         secrets = {}
         if server.get("sshKey"):
             secrets["SERVER_SSH_KEY"] = server["sshKey"]
+        if server.get("password"):
+            secrets["SERVER_PASSWORD"] = server["password"]
         if dep_repo.get("url") and dep_repo.get("password"):
             secrets["DEP_REPO_TOKEN"] = dep_repo["password"]
         return secrets

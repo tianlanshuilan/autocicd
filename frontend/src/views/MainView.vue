@@ -301,6 +301,9 @@
               <div class="form-group" v-if="form.server.authType === 'password'">
                 <label>密码</label>
                 <input v-model="form.server.password" type="password" placeholder="可留空，执行时弹窗输入" />
+                <small class="form-hint" style="color: #e67e22;">
+                  ⚠️ 密码认证需要目标服务器安装 sshpass，建议生产环境使用 SSH 密钥认证
+                </small>
               </div>
               <div class="form-group" v-if="form.server.authType === 'ssh_key'">
                 <label>SSH 私钥</label>
@@ -963,14 +966,14 @@ const tools = [
     features: '云原生托管、内置代码托管与制品库、一键部署阿里云资源',
     suitable: '业务在阿里云上的团队、希望免运维的中小项目',
     hosted: true },
-  { id: 'huawei', name: '华为云流水线', icon: '🔴', desc: '华为云 CodeArts',
+  { id: 'huawei', name: '华为云流水线', icon: '🔴', desc: '华为云 CodeArts（配置生成，需手动导入）',
     features: '深度集成华为云服务、支持信创环境、代码检查能力强',
     suitable: '华为云用户、信创/国产化需求、政企项目',
-    hosted: true },
-  { id: 'tencent', name: '腾讯云 TKE', icon: '🟢', desc: '腾讯云 CI/CD',
+    hosted: true, manualImport: true },
+  { id: 'tencent', name: '腾讯云 TKE', icon: '🟢', desc: '腾讯云 CI/CD（配置生成，需手动导入）',
     features: '与 TKE 容器服务深度集成、支持蓝绿/灰度发布',
     suitable: '腾讯云用户、K8s 容器化部署、微服务架构',
-    hosted: true },
+    hosted: true, manualImport: true },
   { id: 'github', name: 'GitHub Actions', icon: '⚫', desc: 'GitHub 原生 CI/CD',
     features: '与 GitHub 仓库无缝集成、海量社区 Action、YAML 配置简洁',
     suitable: '代码托管在 GitHub 的项目、开源项目、轻量级 CI/CD',

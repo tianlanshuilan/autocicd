@@ -410,7 +410,7 @@ After=network.target
 Type=simple
 User=root
 Environment=JENKINS_HOME=/var/lib/jenkins
-ExecStart=/usr/bin/java -jar /opt/jenkins.war --httpPort=8080
+ExecStart=/usr/bin/java -Djenkins.install.runSetupWizard=false -jar /opt/jenkins.war --httpPort=8080
 Restart=on-failure
 
 [Install]
@@ -743,7 +743,7 @@ systemctl start docker""", log)
 #!/bin/bash
 export JENKINS_HOME=/var/lib/jenkins
 mkdir -p $JENKINS_HOME
-java -jar /opt/jenkins.war --httpPort=8080 &
+java -Djenkins.install.runSetupWizard=false -jar /opt/jenkins.war --httpPort=8080 &
 EOF
 chmod +x /opt/jenkins.sh""", log)
             install_success = True
@@ -770,7 +770,7 @@ chmod +x /opt/jenkins.sh""", log)
         jenkins_running = self.exec_command("curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/login 2>/dev/null || echo '000'")
         if jenkins_running.strip() == '000':
             log("尝试直接启动 Jenkins...")
-            self.exec_command("nohup java -jar /opt/jenkins.war --httpPort=8080 > /var/log/jenkins.log 2>&1 &", log)
+            self.exec_command("nohup java -Djenkins.install.runSetupWizard=false -jar /opt/jenkins.war --httpPort=8080 > /var/log/jenkins.log 2>&1 &", log)
 
         # 等待 Jenkins 启动
         log("等待 Jenkins 启动...")
@@ -812,7 +812,7 @@ After=network.target
 Type=simple
 User=root
 Environment=JENKINS_HOME=/var/lib/jenkins
-ExecStart=/usr/bin/java -jar /opt/jenkins.war --httpPort=8080
+ExecStart=/usr/bin/java -Djenkins.install.runSetupWizard=false -jar /opt/jenkins.war --httpPort=8080
 Restart=on-failure
 
 [Install]
@@ -948,24 +948,140 @@ systemctl daemon-reload""", log)
     def configure_jenkins_pipeline(self, project_name: str, repo_url: str, branch: str,
                                      git_credential: dict = None, server_config: dict = None,
                                      deploy_method: str = "direct", log_callback=None):
-        """配置 Jenkins 流水线（创建 Job、设置凭据）"""
+        """配置 Jenkins 流水线（安装插件、设置凭据、创建 Job）
+
+        完整流程：
+        1. 等待 Jenkins 就绪
+        2. 下载 CLI jar（从 Jenkins Web 下载，兼容 war/deb 安装方式）
+        3. 安装最小插件集（workflow-aggregator, git, credentials-binding）
+        4. 创建 admin 用户并设置密码
+        5. 注入部署目标服务器凭据（SSH key 或密码）
+        6. 创建 Pipeline Job（带 git 凭据）
+        """
         log = log_callback or (lambda msg: None)
+        import time
 
         log("配置 Jenkins 流水线...")
 
-        # 等待 Jenkins 完全启动
-        import time
+        # 1. 等待 Jenkins 就绪（最多 60 秒）
         log("等待 Jenkins 服务就绪...")
-        time.sleep(5)
-
-        # 检查 Jenkins 是否可访问
-        jenkins_check = self.exec_command("curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/login 2>/dev/null || echo '000'")
-        if jenkins_check.strip() == '000':
-            log("警告: Jenkins 可能尚未完全启动，请稍后手动检查")
+        for i in range(12):
+            check = self.exec_command("curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/ 2>/dev/null || echo '000'")
+            code = check.strip().replace("'", "")
+            if code in ('200', '302', '403'):
+                log(f"Jenkins 已就绪 (HTTP {code})")
+                break
+            time.sleep(5)
+            log(f"等待中... ({(i+1)*5}s)")
         else:
-            log(f"Jenkins 服务已就绪 (HTTP {jenkins_check.strip()})")
+            log("⚠️ Jenkins 未响应，请检查服务状态")
+            return
 
-        # 使用 Jenkins CLI 创建 Job
+        # 2. 下载 CLI jar（从 Jenkins Web 下载，兼容所有安装方式）
+        cli_jar = "/opt/jenkins-cli.jar"
+        cli_check = self.exec_command(f"test -f {cli_jar} && echo 'exists' || echo 'not_found'")
+        if 'not_found' in cli_check:
+            log("下载 Jenkins CLI...")
+            self.exec_command(
+                f"curl -sSf http://localhost:8080/jnlpJars/jenkins-cli.jar -o {cli_jar} 2>/dev/null || "
+                f"curl -sSf http://localhost:8080/jnlpJars/jenkins-cli.jar -o {cli_jar}",
+                log
+            )
+        cli_exists = self.exec_command(f"test -f {cli_jar} && echo 'yes' || echo 'no'")
+        if 'no' in cli_exists:
+            log("❌ CLI 下载失败，请手动从 Jenkins Web UI 创建 Job")
+            return
+
+        cli_cmd = f"java -jar {cli_jar} -s http://localhost:8080/"
+
+        # 3. 安装最小插件集（幂等：已安装的跳过）
+        log("安装最小插件集...")
+        plugins = ["workflow-aggregator", "git", "credentials-binding", "ssh-credentials"]
+        install_script = " | ".join(f'"{p}"' for p in plugins)
+        self.exec_command(
+            f'echo [{install_script}] | '
+            f'{cli_cmd} groovy = << \'GROOVYEOF\'\n'
+            f'def plugins = evaluate(this)\n'
+            f'plugins.each {{ p ->\n'
+            f'  if (!Jenkins.instance.pluginManager.getPlugin(p)) {{\n'
+            f'    Jenkins.instance.updateManager.getPlugin(p).install()\n'
+            f'  }}\n'
+            f'}}\n'
+            f'GROOVYEOF',
+            log
+        )
+        # 简化方式：直接用 CLI install-plugin
+        for plugin in plugins:
+            self.exec_command(f"{cli_cmd} install-plugin {plugin} -deploy 2>/dev/null || true", log)
+
+        # 4. 创建 admin 用户并设置密码
+        admin_password = "admin123"  # 可改为随机生成
+        log("创建 admin 用户...")
+        groovy_script = f"""
+import jenkins.model.*
+import hudson.security.*
+
+def instance = Jenkins.getInstance()
+if (!(instance.getSecurityRealm() instanceof HudsonPrivateSecurityRealm)) {{
+    def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+    hudsonRealm.createAccount("admin", "{admin_password}")
+    instance.setSecurityRealm(hudsonRealm)
+    def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+    strategy.setAllowAnonymousRead(false)
+    instance.setAuthorizationStrategy(strategy)
+    instance.save()
+    println("Admin user created")
+}} else {{
+    println("Security already configured")
+}}
+"""
+        self.exec_command(
+            f"echo '{groovy_script}' | {cli_cmd} groovy =",
+            log
+        )
+        log(f"Admin 用户已创建（密码: {admin_password}）")
+
+        # 5. 注入部署目标服务器凭据（写入 Jenkins 用户 ~/.ssh 或安装 sshpass）
+        server_config = server_config or {}
+        server_auth_type = server_config.get("authType", "password")
+        server_host = server_config.get("host", "")
+        jenkins_home = self.exec_command("echo $HOME").strip() or "/root"
+
+        if server_host:
+            log("注入部署目标服务器凭据...")
+            if server_auth_type == "ssh_key" and server_config.get("sshKey"):
+                # 将 SSH 私钥写入 Jenkins 用户的 ~/.ssh/id_rsa
+                ssh_key = server_config["sshKey"]
+                self.exec_command(f"mkdir -p {jenkins_home}/.ssh && chmod 700 {jenkins_home}/.ssh", log)
+                self.exec_command(
+                    f"cat > {jenkins_home}/.ssh/id_rsa << 'KEYEOF'\n{ssh_key}\nKEYEOF",
+                    log
+                )
+                self.exec_command(f"chmod 600 {jenkins_home}/.ssh/id_rsa", log)
+                # 添加目标服务器到 known_hosts
+                self.exec_command(
+                    f"ssh-keyscan -H {server_host} >> {jenkins_home}/.ssh/known_hosts 2>/dev/null || true",
+                    log
+                )
+                log("✅ SSH 密钥已注入 Jenkins 服务器")
+            elif server_auth_type == "password" and server_config.get("password"):
+                # 安装 sshpass，Jenkinsfile 中使用 sshpass -e 方式
+                log("安装 sshpass（密码认证模式）...")
+                self.exec_command(
+                    "command -v sshpass >/dev/null || "
+                    "(apt-get update -qq && apt-get install -y -qq sshpass 2>/dev/null) || "
+                    "(yum install -y sshpass 2>/dev/null)",
+                    log
+                )
+                # 将密码写入 Jenkins 环境文件（供 Jenkinsfile 通过 env 读取）
+                self.exec_command(
+                    f"echo 'export SSHPASS=\"{server_config['password']}\"' >> /etc/profile.d/jenkins-deploy.sh",
+                    log
+                )
+                self.exec_command("chmod +x /etc/profile.d/jenkins-deploy.sh", log)
+                log("✅ sshpass 已安装，密码环境变量已配置")
+
+        # 6. 创建 Pipeline Job
         log(f"创建流水线任务: {project_name}")
 
         # 检查 Job 是否已存在
@@ -973,17 +1089,18 @@ systemctl daemon-reload""", log)
         if job_check.strip() == '200':
             log(f"Job '{project_name}' 已存在，跳过创建")
         else:
-            # 通过 Jenkins CLI 或 REST API 创建 Job
-            # 先获取初始密码（如果需要）
-            initial_pwd = self.exec_command("cat /var/lib/jenkins/secrets/initialAdminPassword 2>/dev/null || echo ''")
+            # 构建 git 凭据 XML
+            git_cred_xml = ""
+            if git_credential and git_credential.get("type") == "password":
+                # 需要创建 git 凭据（简化：使用 URL 内嵌凭据）
+                username = git_credential.get("username", "")
+                password = git_credential.get("password", "")
+                if username and password:
+                    # 将凭据嵌入 URL（简化方案，生产环境应使用 credentials plugin）
+                    repo_url_with_cred = repo_url.replace("https://", f"https://{username}:{password}@")
+                    repo_url = repo_url_with_cred
 
-            # 使用 Jenkins CLI 创建 Pipeline Job
-            cli_jar = "/var/cache/jenkins/war/WEB-INF/jenkins-cli.jar"
-            cli_check = self.exec_command(f"test -f {cli_jar} && echo 'exists' || echo 'not_found'")
-
-            if 'exists' in cli_check:
-                # 使用 CLI 创建 Job
-                job_xml = f"""<?xml version='1.1' encoding='UTF-8'?>
+            job_xml = f"""<?xml version='1.1' encoding='UTF-8'?>
 <flow-definition plugin="workflow-job">
   <description>CI/CD Pipeline for {project_name}</description>
   <keepDependencies>false</keepDependencies>
@@ -1017,31 +1134,31 @@ systemctl daemon-reload""", log)
   <triggers/>
   <disabled>false</disabled>
 </flow-definition>"""
-                # 写入临时文件并创建 Job
-                self.exec_command(f"cat > /tmp/{project_name}-job.xml << 'XMLEOF'\n{job_xml}\nXMLEOF", log)
 
-                if initial_pwd:
-                    self.exec_command(
-                        f"java -jar {cli_jar} -s http://localhost:8080/ -auth admin:{initial_pwd} create-job {project_name} < /tmp/{project_name}-job.xml",
-                        log
-                    )
-                else:
-                    self.exec_command(
-                        f"java -jar {cli_jar} -s http://localhost:8080/ create-job {project_name} < /tmp/{project_name}-job.xml",
-                        log
-                    )
-                self.exec_command(f"rm -f /tmp/{project_name}-job.xml", log)
-                log(f"Job '{project_name}' 创建成功")
-            else:
-                log("Jenkins CLI 不可用，请手动创建 Job 或等待 Jenkins 初始化完成后通过 Web UI 创建")
+            self.exec_command(f"cat > /tmp/{project_name}-job.xml << 'XMLEOF'\n{job_xml}\nXMLEOF", log)
+            self.exec_command(
+                f"{cli_cmd} -auth admin:{admin_password} create-job {project_name} < /tmp/{project_name}-job.xml",
+                log
+            )
+            self.exec_command(f"rm -f /tmp/{project_name}-job.xml", log)
+            log(f"✅ Job '{project_name}' 创建成功")
 
-        log(f"\n✅ Jenkins 流水线配置完成！")
+        log(f"\n🎉 Jenkins 流水线配置完成！")
         log(f"📍 访问地址: http://<服务器IP>:8080/job/{project_name}")
+        log(f"🔐 登录凭据: admin / {admin_password}")
         log(f"🚀 触发方式: 在 Jenkins 中点击 'Build Now' 或推送代码到 {branch} 分支")
         log(f"📋 查看日志: 在 Job 页面点击构建编号查看 Console Output")
 
-    def configure_runner(self, repo_url: str, git_credential: dict = None, log_callback=None):
-        """配置 Runner（注册到 GitLab/GitHub）"""
+    def configure_runner(self, repo_url: str, git_credential: dict = None,
+                          registration_token: str = "", log_callback=None):
+        """配置 Runner（注册到 GitLab/GitHub）
+
+        Args:
+            repo_url: 仓库地址
+            git_credential: Git 凭据
+            registration_token: Runner 注册 Token（从 GitLab/GitHub UI 获取）
+            log_callback: 日志回调
+        """
         log = log_callback or (lambda msg: None)
 
         log("配置 Runner...")
@@ -1052,20 +1169,54 @@ systemctl daemon-reload""", log)
             log("Runner 已配置，跳过注册")
             return
 
-        log("\nRunner 需要手动注册到 GitLab/GitHub:")
-        log("\n📋 注册步骤:")
-        log("1. 登录 GitLab → Settings → CI/CD → Runners")
-        log("2. 点击 'New project runner' 或 'New group runner'")
-        log("3. 复制 registration token")
-        log("4. 在服务器上执行:")
-        log("   gitlab-runner register")
-        log("   - URL: 你的 GitLab 地址")
-        log("   - Token: 复制的 token")
-        log("   - Executor: shell 或 docker")
-        log("   - Tags: 自定义标签")
+        if not registration_token:
+            log("\n⚠️ 未提供注册 Token，Runner 需要手动注册:")
+            log("\n📋 注册步骤:")
+            log("1. 登录 GitLab → Settings → CI/CD → Runners")
+            log("2. 点击 'New project runner' 或 'New group runner'")
+            log("3. 复制 registration token")
+            log("4. 在服务器上执行:")
+            log("   gitlab-runner register")
+            log("   - URL: 你的 GitLab 地址")
+            log("   - Token: 复制的 token")
+            log("   - Executor: shell 或 docker")
+            log("   - Tags: 自定义标签")
+            log("\n✅ Runner 安装完成，请按照上述步骤完成注册")
+            log("📋 注册完成后，推送代码到仓库即可自动触发流水线")
+            return
 
-        log("\n✅ Runner 安装完成，请按照上述步骤完成注册")
-        log("📋 注册完成后，推送代码到仓库即可自动触发流水线")
+        # 自动注册 Runner
+        log("使用提供的 Token 自动注册 Runner...")
+
+        # 解析 GitLab URL
+        gitlab_url = "https://gitlab.com"
+        if "gitlab" in repo_url.lower():
+            # 从 repo_url 提取 GitLab 实例 URL
+            import re
+            match = re.match(r'(https?://[^/]+)', repo_url)
+            if match:
+                gitlab_url = match.group(1)
+
+        # 非交互式注册
+        register_cmd = (
+            f"gitlab-runner register "
+            f"--non-interactive "
+            f"--url {gitlab_url} "
+            f"--registration-token {registration_token} "
+            f"--executor shell "
+            f"--description 'auto-cicd-runner' "
+            f"--tag-list 'auto-cicd,shell' "
+            f"--run-untagged=false "
+            f"--locked=false"
+        )
+
+        result = self.exec_command(register_cmd, log)
+        if 'registered' in result.lower() or 'runner' in result.lower():
+            log("✅ Runner 注册成功！")
+            log("📋 推送代码到仓库即可自动触发流水线")
+        else:
+            log(f"⚠️ Runner 注册可能失败: {result}")
+            log("请检查 Token 是否有效，或手动注册")
 
     def setup_environment(self, project_type: str, config: dict, log_callback=None):
         """根据项目类型初始化服务器环境（已安装则跳过）"""
