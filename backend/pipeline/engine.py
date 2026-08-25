@@ -143,11 +143,17 @@ class PipelineEngine:
             if result["status"] == "failed":
                 return self._build_result(results, False)
 
-            # Step 5: SSH 连接
-            result = await self._step_ssh_connect()
-            results.append(result)
-            if result["status"] == "failed":
-                return self._build_result(results, False)
+            # Step 5: SSH 连接（Android 应用分发 + 云托管工具不需要 SSH）
+            tool = self.config.get("tool", "jenkins")
+            is_app_distribute = self.config.get("projectType") == "android"
+            is_cloud_tool = tool in ("github", "gitlab", "aliyun", "huawei", "tencent")
+            if is_app_distribute and is_cloud_tool:
+                await self.send_message("ssh_connect", "success", "应用分发模式，跳过服务器连接")
+            else:
+                result = await self._step_ssh_connect()
+                results.append(result)
+                if result["status"] == "failed":
+                    return self._build_result(results, False)
 
             # Step 6: 安装 CI/CD 工具（如果是自建工具）
             tool_deploy = self.config.get("toolDeploy", "dedicated")
@@ -1283,6 +1289,9 @@ class PipelineEngine:
         - SERVER_SSH_KEY: 部署目标服务器的 SSH 私钥（SSH 部署阶段使用）
         - SERVER_PASSWORD: 部署目标服务器密码（sshpass 模式使用）
         - DEP_REPO_TOKEN: 独立依赖仓库的访问凭据（克隆依赖仓库使用）
+        - PGYER_API_KEY: 蒲公英 API Key（Android 应用分发）
+        - ANDROID_KEYSTORE_BASE64: Android 签名密钥库 base64
+        - FIREBASE_APP_ID / FIREBASE_CREDENTIALS: Firebase 分发凭据
         """
         server = self.config.get("server", {}) or {}
         dep_repo = self.config.get("dependencyRepo", {}) or {}
@@ -1293,6 +1302,19 @@ class PipelineEngine:
             secrets["SERVER_PASSWORD"] = server["password"]
         if dep_repo.get("url") and dep_repo.get("password"):
             secrets["DEP_REPO_TOKEN"] = dep_repo["password"]
+        # Android 应用分发凭据
+        dist_platform = self.config.get("distributePlatform", "pgyer")
+        dist_key = self.config.get("distributeApiKey", "")
+        if dist_key:
+            if dist_platform == "firebase":
+                secrets["FIREBASE_APP_ID"] = self.config.get("firebaseAppId", "")
+                secrets["FIREBASE_CREDENTIALS"] = dist_key
+            else:
+                secrets["PGYER_API_KEY"] = dist_key
+        keystore = self.config.get("androidKeystore", "")
+        if keystore:
+            # keystore 已经是 base64 编码的字符串（前端上传时编码）
+            secrets["ANDROID_KEYSTORE_BASE64"] = keystore
         return secrets
 
     async def _configure_github_secrets(self, step: str) -> dict:

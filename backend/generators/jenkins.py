@@ -5,8 +5,8 @@ def generate_jenkins(config, output_dir):
     jenkinsfile = _build_jenkinsfile(config)
     files.append({"name": "Jenkinsfile", "content": jenkinsfile})
 
-    # Dockerfile (if docker deploy)
-    if config.deployMethod == "docker":
+    # Dockerfile (if docker deploy, skip for Android)
+    if config.deployMethod == "docker" and config.projectType != "android":
         dockerfile = _build_dockerfile(config)
         files.append({"name": "Dockerfile", "content": dockerfile})
         dockerignore = _build_dockerignore(config)
@@ -27,6 +27,7 @@ def generate_jenkins(config, output_dir):
     elif config.projectType == "go":
         mod = _build_go_mod(config)
         files.append({"name": "go.mod", "content": mod})
+    # Android 不需要额外基础文件（gradle 已在仓库中）
 
     # Jenkins 部署说明
     readme = _build_jenkins_readme(config)
@@ -94,6 +95,9 @@ def _build_jenkinsfile(c):
         stages.append(_build_build_stage(c))  # npm run build
     elif c.projectType == "python":
         stages.append(_build_artifact_stage(c))  # pip install
+    elif c.projectType == "android":
+        stages.append(_build_android_setup_stage(c))
+        stages.append(_build_build_stage(c))  # gradlew assembleRelease
     else:
         stages.append(_build_code_stage(c))  # Just deploy code
     stages.append(_build_test_stage(c))
@@ -262,6 +266,9 @@ def _get_branch_stages(c, branch):
         stages.append(_build_build_stage(c))  # npm run build
     elif c.projectType == "python":
         stages.append(_build_artifact_stage(c))  # pip install
+    elif c.projectType == "android":
+        stages.append(_build_android_setup_stage(c))
+        stages.append(_build_build_stage(c))  # gradlew assembleRelease
     else:
         stages.append(_build_code_stage(c))  # Just deploy code
     stages.append(_build_test_stage(c))
@@ -319,6 +326,13 @@ def _build_build_stage(c):
                 sh '{go_build_cmd(c)}'
             }}
         }}"""
+    elif c.projectType == "android":
+        return """        stage('Build') {
+            steps {
+                sh 'chmod +x gradlew'
+                sh './gradlew assembleRelease'
+            }
+        }"""
     return ""
 
 def _build_artifact_stage(c):
@@ -398,10 +412,86 @@ def _build_test_stage(c):
                 sh 'go test ./...'
             }
         }"""
+    elif c.projectType == "android":
+        return """        stage('Test') {
+            steps {
+                sh './gradlew test'
+            }
+        }"""
     return ""
+
+def _build_android_setup_stage(c):
+    """Android SDK 环境准备阶段"""
+    jdk = getattr(c, 'jdkVersion', None) or '17'
+    return f"""        stage('Setup Android SDK') {{
+            steps {{
+                // Jenkins 需安装 Android SDK 插件或使用已配置 SDK 的 agent
+                echo '检查 Android SDK 环境...'
+                sh '''
+                    if [ -z "$ANDROID_HOME" ]; then
+                        echo "ANDROID_HOME 未设置，尝试自动安装..."
+                        export ANDROID_HOME=$HOME/android-sdk
+                        mkdir -p $ANDROID_HOME
+                        if [ ! -f $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager ]; then
+                            wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip
+                            unzip -q /tmp/cmdtools.zip -d $ANDROID_HOME
+                            mkdir -p $ANDROID_HOME/cmdline-tools/latest
+                            mv $ANDROID_HOME/cmdline-tools/bin $ANDROID_HOME/cmdline-tools/latest/ 2>/dev/null || true
+                            mv $ANDROID_HOME/cmdline-tools/lib $ANDROID_HOME/cmdline-tools/latest/ 2>/dev/null || true
+                        fi
+                        export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+                        yes | sdkmanager --licenses > /dev/null 2>&1 || true
+                    fi
+                    echo "ANDROID_HOME=$ANDROID_HOME"
+                '''
+            }}
+        }}"""
+
+def _build_app_distribute_stage(c):
+    """Android 应用分发阶段（蒲公英 / Firebase）"""
+    platform = getattr(c, 'distributePlatform', 'pgyer')
+    if platform == 'firebase':
+        return """        stage('Distribute') {
+            steps {
+                script {
+                    echo '上传到 Firebase App Distribution...'
+                    sh '''
+                        APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+                        if [ -z "$APK" ]; then APK=$(find . -name "*.apk" | head -1); fi
+                        if [ -z "$APK" ]; then echo "❌ 未找到 APK"; exit 1; fi
+                        echo "📦 上传: $APK"
+                        firebase appdistribution:distribute "$APK" --app "$FIREBASE_APP_ID" --groups "testers"
+                        echo "✅ 已上传到 Firebase App Distribution"
+                    '''
+                }
+            }
+        }"""
+    # 默认蒲公英
+    return """        stage('Distribute') {
+            steps {
+                script {
+                    echo '上传到蒲公英...'
+                    sh '''
+                        APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+                        if [ -z "$APK" ]; then APK=$(find . -name "*.apk" | head -1); fi
+                        if [ -z "$APK" ]; then echo "❌ 未找到 APK"; exit 1; fi
+                        echo "📦 上传: $APK"
+                        curl -sL -X POST https://www.pgyer.com/apiv2/app/upload \\
+                            -d "_api_key=$PGYER_API_KEY" \\
+                            -d "buildUpdateDescription=$BUILD_TAG" \\
+                            -F "file=@$APK"
+                        echo "✅ 已上传到蒲公英"
+                    '''
+                }
+            }
+        }"""
 
 def _build_deploy_stage(c):
     """生成部署阶段（包含备份、部署、启动）"""
+    # Android 应用分发
+    if c.projectType == "android":
+        return _build_app_distribute_stage(c)
+
     # 负载均衡模式：滚动部署到多台后端服务器
     from generators.lb import has_load_balancer
     if has_load_balancer(c):
@@ -669,10 +759,14 @@ def _build_integration_stage(c, env):
 def _build_deploy_stages(c):
     """按配置生成部署阶段列表
 
+    - Android：应用分发（单阶段）
     - 负载均衡：单个滚动部署阶段（_build_deploy_stage 内部已路由）
     - 多环境：每个环境一个 Deploy-<env> 阶段
     - 默认：单个 Deploy 阶段
     """
+    if c.projectType == "android":
+        return [_build_deploy_stage(c)]  # 应用分发，无多环境
+
     from generators.lb import get_environments, has_load_balancer
 
     if has_load_balancer(c):

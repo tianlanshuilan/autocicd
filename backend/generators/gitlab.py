@@ -1,7 +1,7 @@
 def generate_gitlab(config, output_dir):
     files = []
     files.append({"name": ".gitlab-ci.yml", "content": _build_pipeline(config)})
-    if config.deployMethod == "docker":
+    if config.deployMethod == "docker" and config.projectType != "android":
         dockerfile = _build_dockerfile(config)
         files.append({"name": "Dockerfile", "content": dockerfile})
         dockerignore = _build_dockerignore(config)
@@ -39,6 +39,9 @@ def _get_image(c):
         return "python:3.11-slim"
     elif c.projectType == "go":
         return "golang:1.21"
+    elif c.projectType == "android":
+        jdk = c.jdkVersion or "17"
+        return f"eclipse-temurin:{jdk}-jdk"
     return "alpine:latest"
 
 def _get_build_script(c):
@@ -53,6 +56,8 @@ def _get_build_script(c):
         return pip_install_cmd(c)
     elif c.projectType == "go":
         return go_build_cmd(c, cgo_disabled=True)
+    elif c.projectType == "android":
+        return "./gradlew assembleRelease"
     return "echo build"
 
 def _get_test_script(c):
@@ -67,6 +72,8 @@ def _get_test_script(c):
         return "pytest"
     elif c.projectType == "go":
         return "go test ./..."
+    elif c.projectType == "android":
+        return "./gradlew test"
     return "echo test"
 
 def _get_artifacts_path(c):
@@ -78,6 +85,8 @@ def _get_artifacts_path(c):
         return "dist/"
     elif c.projectType == "go":
         return "app"
+    elif c.projectType == "android":
+        return "app/build/outputs/apk/**/*.apk\n      - app/build/outputs/bundle/**/*.aab"
     return "."
 
 def _get_deploy_cmd(c):
@@ -91,6 +100,8 @@ def _get_deploy_cmd(c):
         return "python app.py"
     elif c.projectType == "go":
         return "./app"
+    elif c.projectType == "android":
+        return "echo 'APK built successfully'"
     return "echo deploy"
 
 def _get_deploy_scripts(c):
@@ -107,6 +118,31 @@ def _get_deploy_scripts(c):
             "rm -f /tmp/$CI_PROJECT_NAME.tar.gz",
         ]
     return [_get_deploy_cmd(c)]
+
+def _get_app_distribute_scripts(c):
+    """Android 应用分发脚本（蒲公英 / Firebase）"""
+    platform = getattr(c, 'distributePlatform', 'pgyer')
+    if platform == 'firebase':
+        return [
+            "echo 'Uploading to Firebase App Distribution...'",
+            'APK=$(ls app/build/outputs/apk/release/*.apk | head -1)',
+            'if [ -z "$APK" ]; then APK=$(find . -name "*.apk" | head -1); fi',
+            'if [ -z "$APK" ]; then echo "❌ 未找到 APK"; exit 1; fi',
+            'echo "📦 上传 APK: $APK"',
+            '# Firebase CLI 需提前安装: npm install -g firebase-tools',
+            'firebase appdistribution:distribute "$APK" --app "$FIREBASE_APP_ID" --groups "testers" --release-notes "$CI_COMMIT_MESSAGE"',
+            'echo "✅ 已上传到 Firebase App Distribution"',
+        ]
+    # 默认蒲公英
+    return [
+        "echo 'Uploading to Pgyer...'",
+        'APK=$(ls app/build/outputs/apk/release/*.apk | head -1)',
+        'if [ -z "$APK" ]; then APK=$(find . -name "*.apk" | head -1); fi',
+        'if [ -z "$APK" ]; then echo "❌ 未找到 APK"; exit 1; fi',
+        'echo "📦 上传 APK: $APK"',
+        'curl -sL -X POST https://www.pgyer.com/apiv2/app/upload -d "_api_key=$PGYER_API_KEY" -d "buildUpdateDescription=$CI_COMMIT_MESSAGE" -F "file=@$APK"',
+        'echo "✅ 已上传到蒲公英"',
+    ]
 
 def _get_lb_deploy_scripts(c):
     """负载均衡滚动部署脚本行：打包后执行 deploy/rolling-deploy.sh
@@ -151,9 +187,12 @@ def _build_pipeline(c):
     artifacts_path = _get_artifacts_path(c)
     branches = _get_branches(c)
 
-    # 部署脚本：负载均衡时走滚动部署
+    # 部署脚本：Android 走应用分发，其他走 SSH 部署
     from generators.lb import has_load_balancer, is_integration_mode, get_environments
-    if has_load_balancer(c):
+    is_android = c.projectType == "android"
+    if is_android:
+        deploy_scripts = _get_app_distribute_scripts(c)
+    elif has_load_balancer(c):
         deploy_scripts = _get_lb_deploy_scripts(c)
     else:
         deploy_scripts = _get_deploy_scripts(c)
@@ -181,6 +220,8 @@ def _build_pipeline(c):
         build_step = build_script
     elif c.projectType == "python":
         build_step = build_script
+    elif c.projectType == "android":
+        build_step = f"chmod +x gradlew && {build_script}"
     else:
         build_step = "echo '纯代码模式，跳过构建'"
 
@@ -222,10 +263,14 @@ def _build_pipeline(c):
     - {branches[0]}
 """
 
-    # SSH 认证设置：deploy job 的 before_script 始终包含（密钥优先，回退 sshpass）
+    # SSH 认证设置：Android 应用分发不需要 SSH，其他类型始终包含
     from generators.lb import gitlab_ssh_setup_block
-    ssh_auth_lines = "".join(f"    - {line}\n" for line in gitlab_ssh_setup_block().splitlines())
-    deploy_before = f"  before_script:\n{integration_before}{ssh_auth_lines}"
+    if is_android:
+        ssh_auth_lines = ""
+        deploy_before = f"  before_script:\n{integration_before}" if integration_before else ""
+    else:
+        ssh_auth_lines = "".join(f"    - {line}\n" for line in gitlab_ssh_setup_block().splitlines())
+        deploy_before = f"  before_script:\n{integration_before}{ssh_auth_lines}"
     test_before = f"  before_script:\n{integration_before}" if integration_before else ""
 
     # 多分支时生成并行 job
@@ -331,6 +376,16 @@ deploy_job:
     if envs and getattr(c, 'deployMethod', 'direct') != 'docker' and not has_load_balancer(c):
         env_note = "# 注意：多环境远程部署仅支持 Docker 部署模式，当前模式将部署到默认目标\n"
 
+    # Android SDK 安装（仅 Android 项目）
+    android_sdk_before = ""
+    if is_android:
+        android_sdk_before = """    - apt-get update -qq && apt-get install -y -qq wget unzip > /dev/null
+    - export ANDROID_HOME=/opt/android-sdk
+    - if [ ! -d "$ANDROID_HOME" ]; then mkdir -p $ANDROID_HOME && wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O /tmp/cmdtools.zip && unzip -q /tmp/cmdtools.zip -d $ANDROID_HOME && mv $ANDROID_HOME/cmdline-tools $ANDROID_HOME/latest && mkdir -p $ANDROID_HOME/cmdline-tools && mv $ANDROID_HOME/latest $ANDROID_HOME/cmdline-tools/latest; fi
+    - export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+    - yes | sdkmanager --licenses > /dev/null 2>&1 || true
+"""
+
     return f"""# GitLab CI Pipeline
 # 项目: {c.projectName}
 # 工具: GitLab CI
@@ -357,7 +412,7 @@ build_job:
   stage: build
   image: {image}
   before_script:
-{integration_before}{dep_repo_before}  script:
+{integration_before}{dep_repo_before}{android_sdk_before}  script:
     - {build_step}
   artifacts:
     paths:

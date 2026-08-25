@@ -138,6 +138,13 @@
                 <span class="mode-desc">部署到 TongWeb / Tomcat 等 Java 应用服务器，WAR 包方式</span>
               </div>
             </label>
+            <label class="mode-item" :class="{ active: form.deployMethod === 'app_distribute' }" v-if="isAndroidProject">
+              <input type="radio" v-model="form.deployMethod" value="app_distribute" />
+              <div class="mode-text">
+                <span class="mode-label">📱 应用分发</span>
+                <span class="mode-desc">构建 APK/AAB 并上传到蒲公英、Firebase 等分发平台</span>
+              </div>
+            </label>
           </div>
 
           <!-- 应用服务器子选项 -->
@@ -162,6 +169,37 @@
                 <label>应用上下文路径</label>
                 <input v-model="form.appServer.contextPath" placeholder="/app" />
               </div>
+            </div>
+          </div>
+
+          <!-- Android 应用分发子配置 -->
+          <div class="sub-config" v-if="isAndroidProject && form.deployMethod === 'app_distribute'">
+            <div class="form-group">
+              <label>分发平台</label>
+              <select v-model="form.distributePlatform">
+                <option value="pgyer">蒲公英 (pgyer.com)</option>
+                <option value="firebase">Firebase App Distribution</option>
+              </select>
+            </div>
+            <div class="form-group" v-if="form.distributePlatform === 'pgyer'">
+              <label>蒲公英 API Key <span class="required">*</span></label>
+              <input v-model="form.distributeApiKey" type="password" placeholder="蒲公英 API Key" />
+              <small class="form-hint" style="color: #888;">🔑 获取方式：登录蒲公英 → 账户信息 → API 信息 → API Key</small>
+            </div>
+            <template v-if="form.distributePlatform === 'firebase'">
+              <div class="form-group">
+                <label>Firebase App ID <span class="required">*</span></label>
+                <input v-model="form.firebaseAppId" placeholder="1:123456789:android:abcdef" />
+              </div>
+              <div class="form-group">
+                <label>Firebase Service Account JSON</label>
+                <textarea v-model="form.distributeApiKey" rows="3" placeholder="粘贴 Firebase Service Account JSON 内容"></textarea>
+              </div>
+            </template>
+            <div class="form-group">
+              <label>签名密钥库 (keystore.jks，可选，Base64 编码)</label>
+              <textarea v-model="form.androidKeystore" rows="2" placeholder="粘贴 base64 编码的 keystore 文件内容，用于 Release 签名"></textarea>
+              <small class="form-hint" style="color: #888;">生成命令：base64 -i app/keystore.jks | pbcopy</small>
             </div>
           </div>
         </section>
@@ -277,6 +315,10 @@
             <!-- 中间：目标服务器 -->
             <section class="section auto-info-col auto-info-middle">
               <h3>6. 目标服务器</h3>
+              <template v-if="isAndroidProject && isCloudService">
+                <div class="access-desc" style="margin-bottom: 8px;">📱 Android 应用分发模式不需要部署目标服务器，构建和分发由云平台 Runner 完成</div>
+              </template>
+              <template v-else>
               <div class="form-row">
                 <div class="form-group">
                   <label>服务器地址</label>
@@ -335,6 +377,7 @@
               </div>
 
               <!-- 依赖仓库配置 -->
+              </template>
               <div class="form-group">
                 <label class="section-label">
                   <span>📦 依赖仓库（可选）</span>
@@ -995,6 +1038,7 @@ const projectTypes = [
   { id: 'react', name: 'React', icon: '⚛️', langs: 'React / Next.js' },
   { id: 'python', name: 'Python', icon: '🐍', langs: 'Python / Django / Flask' },
   { id: 'go', name: 'Go', icon: '🔵', langs: 'Go / Golang' },
+  { id: 'android', name: 'Android', icon: '🤖', langs: 'Android / Kotlin / Java' },
 ]
 
 const pipelineSteps = [
@@ -1098,6 +1142,11 @@ const form = reactive({
     healthCheckRetries: 6,
     servers: [],
   },
+  // Android 应用分发配置
+  distributePlatform: 'pgyer',
+  distributeApiKey: '',
+  androidKeystore: '',
+  firebaseAppId: '',
 })
 
 // 自动从 repoUrl 提取 projectName
@@ -1148,6 +1197,11 @@ const currentToolIsCloudOnly = computed(() => {
 // 是否为 Java 项目
 const isJavaProject = computed(() => {
   return form.projectType === 'java-maven' || form.projectType === 'java-gradle'
+})
+
+// 是否为 Android 项目
+const isAndroidProject = computed(() => {
+  return form.projectType === 'android'
 })
 
 // 是否为云托管服务（需要云服务凭据）
@@ -1255,6 +1309,15 @@ watch(() => form.tool, (newTool) => {
   // 云服务凭据提供商随流水线工具自动联动
   if (['aliyun', 'huawei', 'tencent', 'github', 'gitlab'].includes(newTool)) {
     form.cloudCredential.provider = newTool
+  }
+})
+
+// 项目类型切换时自动联动部署方式
+watch(() => form.projectType, (newType) => {
+  if (newType === 'android') {
+    form.deployMethod = 'app_distribute'
+  } else if (form.deployMethod === 'app_distribute') {
+    form.deployMethod = 'docker'
   }
 })
 
@@ -1549,6 +1612,11 @@ async function onAutoDeploy() {
       pipelineMode: form.pipelineMode,  // 流水线模式：release | integration
       environments: validEnvironments().length > 0 ? validEnvironments() : null,  // 多环境配置
       loadBalancer: validLoadBalancer(),  // 负载均衡配置
+      // Android 应用分发配置
+      distributePlatform: form.projectType === 'android' ? form.distributePlatform : null,
+      distributeApiKey: form.projectType === 'android' ? form.distributeApiKey : null,
+      androidKeystore: form.projectType === 'android' ? form.androidKeystore : null,
+      firebaseAppId: form.projectType === 'android' && form.distributePlatform === 'firebase' ? form.firebaseAppId : null,
     }
 
     const { taskId } = await startAutoDeploy(payload)

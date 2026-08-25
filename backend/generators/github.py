@@ -2,8 +2,12 @@ def generate_github(config, output_dir):
     files = []
     workflow_dir = ".github/workflows"
     files.append({"name": f"{workflow_dir}/ci.yml", "content": _build_workflow(config)})
-    files.append({"name": f"{workflow_dir}/deploy.yml", "content": _build_deploy_workflow(config)})
-    if config.deployMethod == "docker":
+    # Android 应用分发不需要 SSH 部署 workflow
+    if config.projectType != "android":
+        files.append({"name": f"{workflow_dir}/deploy.yml", "content": _build_deploy_workflow(config)})
+    else:
+        files.append({"name": f"{workflow_dir}/distribute.yml", "content": _build_app_distribute_workflow(config)})
+    if config.deployMethod == "docker" and config.projectType != "android":
         dockerfile = _build_dockerfile(config)
         files.append({"name": "Dockerfile", "content": dockerfile})
         dockerignore = _build_dockerignore(config)
@@ -42,6 +46,8 @@ def _get_build_cmd(c):
         return pip_install_cmd(c)
     elif c.projectType == "go":
         return go_build_cmd(c, cgo_disabled=True)
+    elif c.projectType == "android":
+        return "./gradlew assembleRelease"
     return "echo build"
 
 def _get_test_cmd(c):
@@ -56,6 +62,8 @@ def _get_test_cmd(c):
         return "pytest"
     elif c.projectType == "go":
         return "go test ./..."
+    elif c.projectType == "android":
+        return "./gradlew test"
     return "echo test"
 
 def _get_artifact_path(c):
@@ -67,6 +75,8 @@ def _get_artifact_path(c):
         return "dist/"
     elif c.projectType == "go":
         return "app"
+    elif c.projectType == "android":
+        return "app/build/outputs/apk/**/*.apk\n            app/build/outputs/bundle/**/*.aab"
     return "."
 
 def _get_deploy_cmd(c):
@@ -80,6 +90,8 @@ def _get_deploy_cmd(c):
         return "python app.py"
     elif c.projectType == "go":
         return "./app"
+    elif c.projectType == "android":
+        return "echo 'APK built successfully'"
     return "echo deploy"
 
 def _get_branches(c):
@@ -129,6 +141,28 @@ def _build_workflow(c):
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+"""
+    setup_android = ""
+    if c.projectType == "android":
+        jdk = c.jdkVersion or "17"
+        setup_android = f"""      - name: Set up JDK {jdk}
+        uses: actions/setup-java@v4
+        with:
+          java-version: '{jdk}'
+          distribution: 'temurin'
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+"""
+    # Android keystore 签名配置（如果提供了 keystore）
+    keystore_step = ""
+    if c.projectType == "android" and getattr(c, 'androidKeystore', ''):
+        keystore_step = """      - name: Decode Keystore
+        run: |
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > app/keystore.jks
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
 """
 
     # 集成测试模式：任意功能分支触发，检出触发分支本身（不固定 ref）
@@ -200,7 +234,7 @@ jobs:
     runs-on: ubuntu-latest
 {matrix_section}    steps:
 {checkout_block}
-{integration_step}{setup_java}{setup_node}{setup_go}{setup_python}      - name: Build
+{integration_step}{setup_java}{setup_node}{setup_go}{setup_python}{setup_android}{keystore_step}      - name: Build
         run: {build}
       - name: Test
         run: {test}
@@ -429,6 +463,86 @@ def _build_direct_deploy_job(c):
           name: build-artifact
       - name: Deploy
         run: {deploy_cmd}
+"""
+
+def _build_app_distribute_workflow(c):
+    """生成 Android 应用分发 workflow（蒲公英 / Firebase App Distribution）"""
+    branches = _get_branches(c)
+    platform = getattr(c, 'distributePlatform', 'pgyer')
+    project_name = c.projectName
+
+    if platform == 'firebase':
+        return f"""# 应用分发 - Firebase App Distribution
+# 项目: {project_name}
+# 平台: Firebase App Distribution
+# 生成: auto-cicd
+
+name: App Distribute
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [{', '.join(branches)}]
+  workflow_dispatch:
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+    if: ${{{{ github.event.workflow_run.conclusion == 'success' }}}}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+      - name: Upload to Firebase App Distribution
+        uses: wzieba/Firebase-Distribution-Github-Action@v1
+        with:
+          appId: ${{{{ secrets.FIREBASE_APP_ID }}}}
+          serviceCredentialsFileContent: ${{{{ secrets.FIREBASE_CREDENTIALS }}}}
+          groups: testers
+          file: app/build/outputs/apk/release/*.apk
+"""
+    # 默认蒲公英
+    return f"""# 应用分发 - 蒲公英
+# 项目: {project_name}
+# 平台: 蒲公英 (pgyer.com)
+# 生成: auto-cicd
+
+name: App Distribute
+
+on:
+  workflow_run:
+    workflows: ["CI Pipeline"]
+    types: [completed]
+    branches: [{', '.join(branches)}]
+  workflow_dispatch:
+
+jobs:
+  distribute:
+    runs-on: ubuntu-latest
+    if: ${{{{ github.event.workflow_run.conclusion == 'success' }}}}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifact
+      - name: Upload to Pgyer
+        run: |
+          APK=$(ls app/build/outputs/apk/release/*.apk | head -1)
+          if [ -z "$APK" ]; then
+            APK=$(find . -name '*.apk' | head -1)
+          fi
+          if [ -z "$APK" ]; then
+            echo "❌ 未找到 APK 文件"
+            exit 1
+          fi
+          echo "📦 上传 APK: $APK"
+          curl -sL -X POST https://www.pgyer.com/apiv2/app/upload \\
+            -d "_api_key=${{{{ secrets.PGYER_API_KEY }}}}" \\
+            -d "buildUpdateDescription=${{{{ github.event.workflow_run.head_commit.message || 'CI 自动发布' }}}}" \\
+            -F "file=@$APK"
+          echo "✅ 已上传到蒲公英"
 """
 
 def _build_release_workflow(c):
