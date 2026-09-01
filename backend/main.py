@@ -157,6 +157,16 @@ class ToolServerConfig(BaseModel):
     sshKey: str = ""
 
 
+class ExistingToolConfig(BaseModel):
+    """已部署的 CI/CD 工具连接配置（toolDeploy=existing）"""
+    url: str = ""              # Jenkins/GitLab Web 地址
+    username: str = "admin"    # 管理员账号
+    authType: str = "password"  # password | token
+    password: str = ""
+    apiToken: str = ""
+    skipTlsVerify: bool = False  # 自签名 HTTPS 证书时跳过校验
+
+
 class HopConfig(BaseModel):
     """单跳配置"""
     type: str = "relay"         # relay | bastion | zero_trust
@@ -211,8 +221,9 @@ class AutoDeployConfig(BaseModel):
     gitAuth: Optional[GitAuth] = None
     server: Optional[ServerConfig] = None
     relayServer: Optional[RelayServerConfig] = None  # 中继服务器（向后兼容）
-    toolDeploy: str = "dedicated"  # dedicated | target | managed
+    toolDeploy: str = "dedicated"  # dedicated | target | managed | existing
     toolServer: Optional[ToolServerConfig] = None
+    existingTool: Optional[ExistingToolConfig] = None  # 已部署工具连接信息
     networkAccess: Optional[NetworkAccessConfig] = None
     appServer: Optional[AppServerConfig] = None
     releaseStrategy: Optional[dict] = None  # 发布策略

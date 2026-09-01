@@ -66,6 +66,44 @@ def _get_branches(c):
         return branches
     return [getattr(c, 'branch', 'main')]
 
+def _build_existing_cred_prepare_stage(auth_mode):
+    """已部署 Jenkins 模式：从注入的凭据准备部署认证环境
+
+    - key: 用 sshUserPrivateKey 凭据写出 ~/.ssh/id_rsa，普通 ssh 直接免密登录
+    - password: 安装 sshpass（SSHPASS 由 environment 中 credentials() 绑定提供）
+    """
+    if auth_mode == "password":
+        return """        stage('Prepare Deploy Credentials') {
+            steps {
+                script {
+                    echo '准备部署凭据（密码认证）...'
+                    sh '''
+                        command -v sshpass >/dev/null 2>&1 || {
+                            (apt-get update -qq && apt-get install -y -qq sshpass 2>/dev/null) ||
+                            (yum install -y -q sshpass 2>/dev/null) ||
+                            echo "WARN: sshpass 安装失败，密码认证部署可能无法非交互执行"
+                        }
+                    '''
+                }
+            }
+        }"""
+    return """        stage('Prepare Deploy Credentials') {
+            steps {
+                script {
+                    echo '准备部署凭据（SSH 密钥认证）...'
+                    withCredentials([sshUserPrivateKey(credentialsId: 'deploy-server-cred', keyFileVariable: 'DEPLOY_KEY_FILE')]) {
+                        sh '''
+                            mkdir -p ~/.ssh && chmod 700 ~/.ssh
+                            cp "$DEPLOY_KEY_FILE" ~/.ssh/id_rsa
+                            chmod 600 ~/.ssh/id_rsa
+                            ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null || true
+                        '''
+                    }
+                }
+            }
+        }"""
+
+
 def _build_jenkinsfile(c):
     branches = _get_branches(c)
 
@@ -103,6 +141,20 @@ def _build_jenkinsfile(c):
     stages.append(_build_test_stage(c))
     stages.extend(_build_deploy_stages(c))
 
+    # 已部署 Jenkins 模式：部署凭据来自 Jenkins Credentials，需在流水线首部准备
+    is_existing = getattr(c, 'toolDeploy', '') == 'existing'
+    server_host_early = getattr(c, 'serverHost', '')
+    server_auth_type = getattr(c, 'serverAuthType', 'password')
+    ssh_prefix = ""
+    cred_env = ""
+    if is_existing and server_host_early:
+        if server_auth_type == 'password':
+            ssh_prefix = "sshpass -e "
+            cred_env = "\n        SSHPASS = credentials('deploy-server-cred')"
+            stages.insert(0, _build_existing_cred_prepare_stage('password'))
+        else:
+            stages.insert(0, _build_existing_cred_prepare_stage('key'))
+
     stage_blocks = "\n".join(stages)
 
     # 服务器配置
@@ -133,7 +185,8 @@ def _build_jenkinsfile(c):
         SERVER_HOST = '{server_host}'
         SERVER_USER = '{server_user}'
         DEPLOY_PATH = '{deploy_path}'
-        SSH_OPTIONS = '{ssh_options}'{dep_repo_env}
+        SSH_OPTIONS = '{ssh_options}'
+        SSH_PREFIX = '{ssh_prefix}'{cred_env}{dep_repo_env}
     }}"""
 
     return f"""// Jenkins Pipeline - {c.projectName}
@@ -229,6 +282,7 @@ pipeline {{
         REPO_URL = '{c.repoUrl}'
         PORT = '{c.port}'
         MAIN_BRANCH = '{main_branch}'
+        SSH_PREFIX = ''
     }}
 
     stages {{
@@ -514,7 +568,7 @@ def _build_deploy_stage(c):
         backup_step = f"""
                 // 备份旧版本
                 echo '备份旧版本...'
-                ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                     DEPLOY_DIR={deploy_path}/${{PROJECT_NAME}}
                     BACKUP_DIR={deploy_path}/backup
                     if [ -d \"$DEPLOY_DIR\" ]; then
@@ -536,14 +590,14 @@ def _build_deploy_stage(c):
                     echo '部署到目标服务器...'
 {backup_step}
                     // 停止旧服务
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "{c.projectName}.jar" 2>/dev/null || true
                         sleep 2
                     '''
                     // 传输新包
-                    scp ${{SSH_OPTIONS}} target/{c.projectName}.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ${{SSH_PREFIX}}scp ${{SSH_OPTIONS}} target/{c.projectName}.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
                     // 启动新服务
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         nohup java -jar {c.projectName}.jar --server.port={c.port} > app.log 2>&1 &
                         echo "应用已启动，端口: {c.port}"
@@ -557,12 +611,12 @@ def _build_deploy_stage(c):
                 script {{
                     echo '部署到目标服务器...'
 {backup_step}
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "{c.projectName}" 2>/dev/null || true
                         sleep 2
                     '''
-                    scp ${{SSH_OPTIONS}} build/libs/{c.projectName}-*.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}scp ${{SSH_OPTIONS}} build/libs/{c.projectName}-*.jar ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         nohup java -jar {c.projectName}-*.jar --server.port={c.port} > app.log 2>&1 &
                         echo "应用已启动，端口: {c.port}"
@@ -577,12 +631,12 @@ def _build_deploy_stage(c):
                     echo '部署到目标服务器...'
 {backup_step}
                     // 清理旧文件并传输新文件
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         rm -rf {deploy_path}/${{PROJECT_NAME}}/dist/*
                     '''
-                    scp ${{SSH_OPTIONS}} -r dist/* ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/dist/
+                    ${{SSH_PREFIX}}scp ${{SSH_OPTIONS}} -r dist/* ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/dist/
                     // 重启 Nginx
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         sudo nginx -s reload 2>/dev/null || sudo systemctl reload nginx
                         echo "Nginx 已重新加载"
                     '''
@@ -595,12 +649,12 @@ def _build_deploy_stage(c):
                 script {{
                     echo '部署到目标服务器...'
 {backup_step}
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "python.*{c.projectName}" 2>/dev/null || true
                         sleep 2
                     '''
-                    scp ${{SSH_OPTIONS}} -r . ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}scp ${{SSH_OPTIONS}} -r . ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         {pip_remote_cmd}
                         nohup python app.py > app.log 2>&1 &
@@ -615,12 +669,12 @@ def _build_deploy_stage(c):
                 script {{
                     echo '部署到目标服务器...'
 {backup_step}
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         pkill -f "./app" 2>/dev/null || true
                         sleep 2
                     '''
-                    scp ${{SSH_OPTIONS}} ./app ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}scp ${{SSH_OPTIONS}} ./app ${{SERVER_USER}}@${{SERVER_HOST}}:{deploy_path}/${{PROJECT_NAME}}/
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         cd {deploy_path}/${{PROJECT_NAME}}
                         chmod +x app
                         nohup ./app > app.log 2>&1 &
@@ -647,11 +701,11 @@ def _build_docker_deploy_stage(c):
                         tar --exclude='.git' --exclude='node_modules' --exclude='target' \\
                             --exclude='build' --exclude='dist' --exclude='.dep-repo' \\
                             -czf /tmp/${{PROJECT_NAME}}.tar.gz .
-                        scp ${{SSH_OPTIONS}} /tmp/${{PROJECT_NAME}}.tar.gz ${{SERVER_USER}}@${{SERVER_HOST}}:/tmp/
+                        ${{SSH_PREFIX}}scp ${{SSH_OPTIONS}} /tmp/${{PROJECT_NAME}}.tar.gz ${{SERVER_USER}}@${{SERVER_HOST}}:/tmp/
                         rm -f /tmp/${{PROJECT_NAME}}.tar.gz
                     '''
                     // 在目标服务器解压并用 docker-compose 构建运行
-                    ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
+                    ${{SSH_PREFIX}}ssh ${{SSH_OPTIONS}} ${{SERVER_USER}}@${{SERVER_HOST}} '''
                         DEPLOY_DIR={deploy_path}/${{PROJECT_NAME}}
                         mkdir -p "$DEPLOY_DIR"
                         tar -xzf /tmp/${{PROJECT_NAME}}.tar.gz -C "$DEPLOY_DIR"

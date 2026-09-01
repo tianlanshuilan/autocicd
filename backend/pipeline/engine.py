@@ -155,10 +155,10 @@ class PipelineEngine:
                 if result["status"] == "failed":
                     return self._build_result(results, False)
 
-            # Step 6: 安装 CI/CD 工具（如果是自建工具）
+            # Step 6: 安装 CI/CD 工具（自建工具）；existing 模式跳过安装仅准备运行环境
             tool_deploy = self.config.get("toolDeploy", "dedicated")
             tool = self.config.get("tool", "jenkins")
-            if tool_deploy in ("dedicated", "target") and tool in ("jenkins", "runner"):
+            if tool_deploy in ("dedicated", "target", "existing") and tool in ("jenkins", "runner"):
                 result = await self._step_install_tool()
                 results.append(result)
                 if result["status"] == "failed":
@@ -833,6 +833,20 @@ class PipelineEngine:
         tool_deploy = self.config.get("toolDeploy", "dedicated")
         use_china_mirror = self.config.get("useChinaMirror", False)  # 是否使用国内镜像
 
+        # 已部署工具模式：跳过安装，仅在部署目标服务器准备运行环境
+        if tool_deploy == "existing":
+            await self.send_message(step, "running", "检测到已部署的 CI/CD 工具，跳过安装，准备部署目标运行环境...")
+            if self.ssh_ops:
+                try:
+                    await self._prepare_target_runtime(use_china_mirror)
+                    await self._prepare_extra_runtimes(use_china_mirror)
+                except SSHError as e:
+                    await self.send_message(step, "running", f"⚠️ 部署目标运行环境准备警告: {e}")
+            else:
+                await self.send_message(step, "running", "未配置部署目标服务器，跳过运行环境准备")
+            await self.send_message(step, "success", "已复用现有 CI/CD 工具，无需安装")
+            return {"step": step, "status": "success", "message": "复用现有工具"}
+
         if not self.ssh_ops:
             await self.send_message(step, "failed", "SSH 未连接")
             return {"step": step, "status": "failed", "message": "SSH 未连接"}
@@ -1086,6 +1100,18 @@ class PipelineEngine:
         tool_deploy = self.config.get("toolDeploy", "dedicated")
 
         try:
+            # 已部署工具：通过 HTTP API 连接现有 Jenkins / 复用现有 Runner
+            if tool_deploy == "existing" and tool == "jenkins":
+                return await self._configure_existing_jenkins()
+
+            if tool_deploy == "existing" and tool == "runner":
+                await self.send_message(step, "running", "复用已注册的 Runner，校验流水线配置...")
+                await self.send_message(
+                    step, "success",
+                    "已复用现有 Runner，配置已推送到仓库，流水线自动生效"
+                )
+                return {"step": step, "status": "success", "message": "复用现有 Runner"}
+
             if tool_deploy in ("dedicated", "target") and tool == "jenkins":
                 # Jenkins: 创建 Job、配置凭据
                 await self.send_message(step, "running", "正在配置 Jenkins 流水线...")
@@ -1156,6 +1182,106 @@ class PipelineEngine:
                 return {"step": step, "status": "success", "message": "流水线已就绪"}
 
         except SSHError as e:
+            await self.send_message(step, "failed", str(e))
+            return {"step": step, "status": "failed", "message": str(e)}
+
+    async def _configure_existing_jenkins(self) -> dict:
+        """通过 HTTP API 连接已部署的 Jenkins：注入凭据 + 创建/更新 Job"""
+        step = "configure_pipeline"
+        et = self.config.get("existingTool", {}) or {}
+        url = (et.get("url") or "").strip()
+        username = et.get("username") or "admin"
+        auth_type = et.get("authType", "password")
+        password = et.get("password") or ""
+        api_token = et.get("apiToken") or ""
+        skip_tls = bool(et.get("skipTlsVerify", False))
+
+        if not url:
+            await self.send_message(step, "failed", "未提供 Jenkins 地址")
+            return {"step": step, "status": "failed", "message": "Jenkins 地址为空"}
+
+        # 密码/Token 缺失时弹窗补充
+        secret = api_token if auth_type == "token" else password
+        if not secret:
+            cred = await self.request_credential(
+                "jenkins_admin",
+                "请输入已部署 Jenkins 的管理员密码或 API Token"
+            )
+            if cred:
+                if auth_type == "token":
+                    api_token = cred.get("token") or cred.get("password") or ""
+                else:
+                    password = cred.get("password") or ""
+                secret = api_token or password
+            if not secret:
+                await self.send_message(step, "failed", "缺少 Jenkins 管理员凭据")
+                return {"step": step, "status": "failed", "message": "凭据缺失"}
+
+        await self.send_message(step, "running", f"连接已部署的 Jenkins: {url}")
+
+        project_name = self.config.get("projectName", "app")
+        repo_url = self.config.get("repoUrl", "")
+        branch = self.config.get("branch", "main")
+        server_config = self.config.get("server", {}) or {}
+        git_cred = self.config.get("gitAuth", {}) or {}
+        log_cb = self._sync_log_factory(step)
+
+        def _do_configure():
+            from .jenkins_api import JenkinsAPI, JenkinsAPIError, build_pipeline_job_xml
+            api = JenkinsAPI(
+                url, username, password=password, api_token=api_token,
+                verify_ssl=not skip_tls, log_callback=log_cb
+            )
+            ok, msg = api.test_connection()
+            if not ok:
+                raise JenkinsAPIError(msg)
+            log_cb(msg)
+
+            # 1. 注入部署目标服务器凭据（供 Jenkinsfile 使用）
+            if server_config.get("host"):
+                s_user = server_config.get("username", "root")
+                if server_config.get("authType") == "ssh_key" and server_config.get("sshKey"):
+                    api.inject_ssh_key_credential(
+                        "deploy-server-cred", s_user, server_config["sshKey"],
+                        description=f"Deploy SSH key for {project_name}"
+                    )
+                elif server_config.get("password"):
+                    api.inject_username_password_credential(
+                        "deploy-server-cred", s_user, server_config["password"],
+                        description=f"Deploy password for {project_name}"
+                    )
+
+            # 2. 注入 Git 仓库凭据（私有仓库）
+            git_cred_id = ""
+            if git_cred.get("type") == "password" and git_cred.get("username") and git_cred.get("password"):
+                git_cred_id = "git-repo-cred"
+                api.inject_username_password_credential(
+                    git_cred_id, git_cred["username"], git_cred["password"],
+                    description=f"Git credential for {project_name}"
+                )
+            elif git_cred.get("type") == "ssh_key" and git_cred.get("sshKey"):
+                git_cred_id = "git-repo-cred"
+                api.inject_ssh_key_credential(
+                    git_cred_id, "git", git_cred["sshKey"],
+                    description=f"Git SSH key for {project_name}"
+                )
+
+            # 3. 创建/更新 Pipeline Job
+            job_xml = build_pipeline_job_xml(project_name, repo_url, branch, git_cred_id)
+            if not api.create_or_update_job(project_name, job_xml):
+                raise JenkinsAPIError("创建 Jenkins Job 失败，请检查账号权限")
+            return True
+
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _do_configure)
+            job_url = f"{url.rstrip('/')}/job/{project_name}"
+            await self.send_message(
+                step, "success",
+                f"已在现有 Jenkins 上配置流水线: {job_url}"
+            )
+            return {"step": step, "status": "success", "message": job_url}
+        except Exception as e:
             await self.send_message(step, "failed", str(e))
             return {"step": step, "status": "failed", "message": str(e)}
 

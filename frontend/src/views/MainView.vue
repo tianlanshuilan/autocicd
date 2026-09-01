@@ -55,9 +55,19 @@
           </div>
         </div>
         <!-- 执行按钮 -->
-        <button class="execute-btn" :class="{ active: canExecute }" :disabled="!canExecute" @click="executeAction">
-          {{ mode === 'generate' ? '📄 生成配置' : '🚀 开始搭建' }}
-        </button>
+        <div class="execute-wrap">
+          <button class="execute-btn" :class="{ active: canExecute }" :disabled="!canExecute" @click="executeAction">
+            {{ mode === 'generate' ? '📄 生成配置' : '🚀 开始搭建' }}
+          </button>
+          <div class="execute-hint" v-if="!canExecute && missingFields.length">
+            <span class="hint-icon">⚠️</span>
+            <span>还需填写：<strong>{{ missingFields.join('、') }}</strong></span>
+          </div>
+          <div class="execute-hint ready" v-else-if="canExecute">
+            <span class="hint-icon">✅</span>
+            <span>配置完整，可以{{ mode === 'generate' ? '生成' : '开始搭建' }}</span>
+          </div>
+        </div>
         </div>
       </div>
       </div>
@@ -701,6 +711,13 @@
                   <span class="mode-desc">CI/CD 工具直接安装在应用运行的同一台服务器上，简单但耦合</span>
                 </div>
               </label>
+              <label class="mode-item" :class="{ active: form.toolDeploy === 'existing' }">
+                <input type="radio" v-model="form.toolDeploy" value="existing" />
+                <div class="mode-text">
+                  <span class="mode-label">🔗 已部署的工具</span>
+                  <span class="mode-desc">已有运行中的 Jenkins/Runner，提供地址和管理账号，跳过安装直接创建流水线 Job</span>
+                </div>
+              </label>
             </div>
             <div class="mode-list" v-else>
               <label class="mode-item active">
@@ -743,6 +760,47 @@
                   <textarea v-model="form.toolServer.sshKey" rows="2" placeholder="粘贴 SSH 私钥内容"></textarea>
                 </div>
               </div>
+            </div>
+
+            <!-- 已部署工具配置（连接现有 Jenkins/Runner） -->
+            <div class="sub-config" v-if="form.toolDeploy === 'existing'">
+              <div class="access-desc" style="margin-bottom: 12px;">
+                🔗 连接已运行的 <strong>{{ form.tool === 'jenkins' ? 'Jenkins' : 'GitLab Runner' }}</strong>，跳过安装步骤，直接在其上创建流水线。
+                <template v-if="form.tool === 'jenkins'">需提供 Jenkins Web 地址与管理员账号（用于通过 API 创建 Job、注入部署凭据）。</template>
+                <template v-else>Runner 已注册到 GitLab，配置推送到仓库后即生效；如需自动注册请提供 GitLab 地址与 Runner Token。</template>
+              </div>
+              <div class="tool-server-row">
+                <div class="form-group" style="flex: 2;">
+                  <label>{{ form.tool === 'jenkins' ? 'Jenkins 地址' : 'GitLab 地址' }} <span style="color:#e5484d">*</span></label>
+                  <input v-model="form.existingTool.url"
+                         :placeholder="form.tool === 'jenkins' ? 'http://10.0.0.5:8080' : 'https://gitlab.example.com'" />
+                </div>
+                <template v-if="form.tool === 'jenkins'">
+                  <div class="form-group">
+                    <label>管理员账号 <span style="color:#e5484d">*</span></label>
+                    <input v-model="form.existingTool.username" placeholder="admin" />
+                  </div>
+                  <div class="form-group">
+                    <label>认证方式</label>
+                    <select v-model="form.existingTool.authType">
+                      <option value="password">登录密码</option>
+                      <option value="token">API Token</option>
+                    </select>
+                  </div>
+                  <div class="form-group" v-if="form.existingTool.authType === 'password'">
+                    <label>管理员密码 <span style="color:#e5484d">*</span></label>
+                    <input v-model="form.existingTool.password" type="password" placeholder="Jenkins 登录密码" />
+                  </div>
+                  <div class="form-group" v-if="form.existingTool.authType === 'token'">
+                    <label>API Token <span style="color:#e5484d">*</span></label>
+                    <input v-model="form.existingTool.apiToken" type="password" placeholder="用户 → Configure → API Token" />
+                  </div>
+                </template>
+              </div>
+              <label class="checkbox-inline" v-if="form.tool === 'jenkins' && form.existingTool.url.startsWith('https')" style="margin-top:8px;">
+                <input type="checkbox" v-model="form.existingTool.skipTlsVerify" />
+                <span>跳过 TLS 证书校验（仅适用于自签名证书的内网 Jenkins，会降低安全性）</span>
+              </label>
             </div>
           </section>
 
@@ -1074,6 +1132,15 @@ const form = reactive({
     password: '',
     sshKey: '',
   },
+  // 已部署的 CI/CD 工具（连接现有 Jenkins/Runner，跳过安装）
+  existingTool: {
+    url: '',            // Jenkins 地址，如 http://10.0.0.5:8080
+    username: 'admin',  // 管理员账号
+    authType: 'password', // password | token
+    password: '',       // 管理员密码
+    apiToken: '',       // 或 API Token
+    skipTlsVerify: false, // 自签名 HTTPS 证书时跳过校验
+  },
   gitAuth: {
     type: 'password',
     username: '',
@@ -1361,23 +1428,49 @@ watch(() => form.cloudCredential.provider, (p) => {
 })
 
 // 执行按钮条件检查
-const canExecute = computed(() => {
-  // 基本条件：仓库 URL 和项目名称
-  if (!form.repoUrl || !form.projectName) return false
-  
+// 缺失的必填字段清单（用于按钮旁提示，解决“点击无反应”）
+const missingFields = computed(() => {
+  const missing = []
+  if (!form.repoUrl || !form.repoUrl.trim()) missing.push('项目仓库 URL')
+  if (!form.projectName || !form.projectName.trim()) missing.push('项目名称')
+
   if (mode.value === 'auto') {
-    // 自动搭建模式需要更多条件
-    if (!form.server.host) return false
-    if (!form.branch || form.branch.trim() === '') return false
-    // 专用服务器模式：工具服务器地址必填
-    if (form.toolDeploy === 'dedicated' && !form.toolServer.host) return false
-    // 云托管工具：AccessKey 模式必填（github/gitlab 用可选 Token，不强制）
+    if (!form.branch || !form.branch.trim()) missing.push('默认分支名')
+    // Android + 云托管：无需部署服务器；其余情况需目标服务器
+    const androidCloud = form.projectType === 'android' && isCloudService.value
+    if (!androidCloud && !form.server.host) missing.push('目标服务器地址')
+    // 工具部署位置相关
+    if (form.toolDeploy === 'dedicated' && !form.toolServer.host) {
+      missing.push('工具服务器地址')
+    }
+    if (form.toolDeploy === 'existing') {
+      if (!form.existingTool.url || !form.existingTool.url.trim()) {
+        missing.push(form.tool === 'jenkins' ? 'Jenkins 地址' : 'GitLab 地址')
+      }
+      if (form.tool === 'jenkins') {
+        if (!form.existingTool.username || !form.existingTool.username.trim()) missing.push('Jenkins 管理员账号')
+        const secret = form.existingTool.authType === 'token' ? form.existingTool.apiToken : form.existingTool.password
+        if (!secret || !secret.trim()) missing.push(form.existingTool.authType === 'token' ? 'Jenkins API Token' : 'Jenkins 管理员密码')
+      }
+    }
+    // 云托管工具：AccessKey 模式必填
     if (isCloudService.value && cloudAuthMode.value === 'accesskey'
-        && (!form.cloudCredential.accessKeyId || !form.cloudCredential.accessKeySecret)) return false
+        && (!form.cloudCredential.accessKeyId || !form.cloudCredential.accessKeySecret)) {
+      missing.push('云服务 AccessKey')
+    }
+    // 集成测试模式：至少一个有效环境
+    if (form.pipelineMode === 'integration' && validEnvironments().length === 0) {
+      missing.push('至少一个集成测试环境')
+    }
+    // 负载均衡
+    if (form.loadBalancer.enabled && !validLoadBalancer()) {
+      missing.push('负载均衡 LB 地址与后端服务器')
+    }
   }
-  
-  return true
+  return missing
 })
+
+const canExecute = computed(() => missingFields.value.length === 0)
 
 // 执行动作
 function executeAction() {
@@ -1553,27 +1646,10 @@ function onGenerate() {
 }
 
 async function onAutoDeploy() {
-  if (!form.repoUrl || !form.projectName) {
-    error.value = '请填写项目仓库 URL 和项目名称'
-    return
-  }
-  if (!form.server.host) {
-    error.value = '请填写目标服务器地址'
-    return
-  }
-  // 专用服务器模式：必须填写工具服务器地址
-  if (form.toolDeploy === 'dedicated' && !form.toolServer.host) {
-    error.value = '已选择专用服务器部署，请填写 CI/CD 工具服务器地址'
-    return
-  }
-  // 集成测试模式：至少需要一个有效环境
-  if (form.pipelineMode === 'integration' && validEnvironments().length === 0) {
-    error.value = '集成测试模式需要至少配置一个环境（环境名 + 集成分支 + 服务器地址）'
-    return
-  }
-  // 负载均衡：启用后必须填写 LB 地址与至少一台后端服务器
-  if (form.loadBalancer.enabled && !validLoadBalancer()) {
-    error.value = '已启用负载均衡，请填写 LB 服务器地址并添加至少一台后端服务器'
+  // 统一使用 missingFields 校验，并滚动到顶部提示
+  if (missingFields.value.length > 0) {
+    error.value = '请先补全必填项：' + missingFields.value.join('、')
+    window.scrollTo({ top: 0, behavior: 'smooth' })
     return
   }
 
@@ -1604,6 +1680,7 @@ async function onAutoDeploy() {
       server: form.server,
       toolDeploy: form.toolDeploy,
       toolServer: form.toolDeploy === 'dedicated' ? form.toolServer : null,
+      existingTool: form.toolDeploy === 'existing' ? form.existingTool : null,
       networkAccess: showAccessConfig.value && form.networkAccess.hops.length > 0 ? form.networkAccess : null,
       appServer: form.deployMethod === 'app_server' ? form.appServer : null,
       useChinaMirror: form.useChinaMirror,  // 国内镜像选项
@@ -1926,6 +2003,38 @@ async function fetchRecommendations() {
   background: #3a7bc8;
   border-color: #3a7bc8;
 }
+
+/* 执行按钮包装 + 缺失字段提示 */
+.execute-wrap {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  max-width: 340px;
+}
+.execute-wrap .execute-btn { margin-left: 0; }
+.execute-hint {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: #b26a00;
+  background: #fff8ec;
+  border: 1px solid #ffe0b2;
+  border-radius: 6px;
+  padding: 5px 10px;
+  text-align: right;
+  justify-content: flex-end;
+}
+.execute-hint.ready {
+  color: #1a7f37;
+  background: #eefbf1;
+  border-color: #b7e4c3;
+}
+.execute-hint .hint-icon { flex-shrink: 0; }
+.execute-hint strong { font-weight: 700; }
 
 /* 模式按钮包装与提示 */
 .mode-btn-wrap { position: relative; }
